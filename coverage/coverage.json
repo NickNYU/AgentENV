@@ -1,0 +1,25 @@
+{
+  "branches": {
+    "coverage": "-",
+    "missed": 0,
+    "total": 0
+  },
+  "functions": {
+    "coverage": "70.04%",
+    "missed": 1375,
+    "total": 4590
+  },
+  "generated_at": "2026-07-25T13:17:24Z",
+  "lines": {
+    "coverage": "73.94%",
+    "missed": 9809,
+    "total": 37647
+  },
+  "package": "workspace",
+  "regions": {
+    "coverage": "73.11%",
+    "missed": 14088,
+    "total": 52386
+  },
+  "run_url": null
+}
