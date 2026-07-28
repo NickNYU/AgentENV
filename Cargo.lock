@@ -90,7 +90,6 @@ name = "agentenv"
 version = "0.1.0"
 dependencies = [
  "agentenv-observability",
- "agentenv-test-support",
  "agentenv_http_server",
  "anyhow",
  "async-trait",
@@ -101,7 +100,6 @@ dependencies = [
  "chrono",
  "clap",
  "confique",
- "criterion",
  "custom_extension_client",
  "dashmap",
  "envd",
@@ -159,6 +157,39 @@ dependencies = [
  "uvm-ublk-daemon",
  "warm-pool",
  "which 8.0.2",
+]
+
+[[package]]
+name = "agentenv-benchmarks"
+version = "0.1.0"
+dependencies = [
+ "agentenv",
+ "anyhow",
+ "criterion",
+ "libc",
+ "libublk-rs-sys",
+ "overlaybd",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "storage-util",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "uvm-ublk",
+]
+
+[[package]]
+name = "agentenv-e2e-tests"
+version = "0.1.0"
+dependencies = [
+ "agentenv",
+ "agentenv-test-support",
+ "anyhow",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

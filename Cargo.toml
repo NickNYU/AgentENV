@@ -9,6 +9,8 @@ members = [
     ".",
     "adev",
     "crates/aenv",
+    "crates/benchmarks",
+    "crates/e2e-tests",
     "crates/linux-cap",
     "crates/observability",
     "crates/object-store-operator",
@@ -29,30 +31,8 @@ members = [
 path = "src/lib.rs"
 
 [dev-dependencies]
-criterion = { version = "0.8", features = ["async_tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-agentenv-test-support = { path = "crates/test-support" }
-
-[[bench]]
-name = "snapshot"
-path = "benches/snapshot_benchmark.rs"
-harness = false
-
-[[bench]]
-name = "ublk_overlaybd"
-path = "benches/ublk_overlaybd_benchmark.rs"
-harness = false
-
-[[bench]]
-name = "orchestrator_store"
-path = "benches/orchestrator_store_benchmark.rs"
-harness = false
-
-[[bench]]
-name = "oci_conversion_pipeline"
-path = "benches/oci_conversion_pipeline_benchmark.rs"
-harness = false
 
 [dependencies]
 firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client" }

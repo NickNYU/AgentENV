@@ -204,7 +204,7 @@ across sandbox capture, publish, resolve, launch, and rebuild flows, including:
 - runtime mount mode for readonly and writable drives
 - rebuild keeping attached-drive metadata stable
 
-`tests/snapshot_oss_e2e_test.rs` covers OSS-backed snapshot publication,
+`crates/e2e-tests/tests/snapshot_oss_e2e_test.rs` covers OSS-backed snapshot publication,
 resolution, alias cleanup, missing managed-layer failure modes, and deletion.
 
 Repository/backend unit tests under `src/snapshot/repository/backends/` cover:

@@ -519,7 +519,7 @@ resumed_sandbox.stop().await?;
 5. Ensure `/dev/kvm` is accessible by the runtime user.
 6. If you run template tests, ensure the host can run `regctl` (server setup installs it automatically from the `[regclient]` manifest entry) and access the registry for template `fromImage` resolution.
 7. Run `scripts/tests/e2e/run_e2e.sh` for API-level E2E coverage. The runner exports `E2E_TEMPLATE_USER_IMAGE`. Suite `05_template_lifecycle.sh` also creates a template build with `E2E_SHORT_USER_IMAGE` to verify short-name image resolution.
-8. Run `make test-agent-integration` to run the `agentenv` integration test modules in `tests/integration/` as a non-root user with the required capabilities, plus the Docker/MinIO-backed OSS snapshot repository test (`tests/snapshot_oss_e2e_test.rs`).
+8. Run `make test-agent-integration` to run the `agentenv` integration test modules in `tests/integration/` as a non-root user with the required capabilities, plus the Docker/MinIO-backed OSS snapshot repository test (`crates/e2e-tests/tests/snapshot_oss_e2e_test.rs`).
 9. Run `make test-ublk` to run the `uvm-ublk` and `overlaybd` storage tests, including the Docker/MinIO-backed OSS backend test (`storage/overlaybd/tests/oss_backend_minio.rs`).
 
 ## 4.1) Firecracker Client and Runtime Upgrade Checklist

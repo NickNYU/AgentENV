@@ -137,7 +137,7 @@ test-agent-integration: prepare-agent-test-state
 		--test orchestrator_integration
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
 	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --test snapshot_oss_e2e_test -- --ignored
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv-e2e-tests --test snapshot_oss_e2e_test -- --ignored
 
 build-ublk:
 	$(CARGO) build $(CARGO_PROFILE_FLAG) -p uvm-ublk -p uvm-ublk-daemon
@@ -156,22 +156,22 @@ test-ublk:
 
 bench:
 	$(MAKE) install-ublk PROFILE=release
-	$(CAPABILITY_RUNNER) $(CARGO) bench
+	$(CAPABILITY_RUNNER) $(CARGO) bench -p agentenv-benchmarks
 
 bench-snapshot:
 	$(MAKE) install-ublk PROFILE=release
-	$(CAPABILITY_RUNNER) $(CARGO) bench --bench snapshot
+	$(CAPABILITY_RUNNER) $(CARGO) bench -p agentenv-benchmarks --bench snapshot
 
 bench-ublk:
 	$(MAKE) install-ublk PROFILE=release
-	$(CAPABILITY_RUNNER) $(CARGO) bench --bench ublk_overlaybd
+	$(CAPABILITY_RUNNER) $(CARGO) bench -p agentenv-benchmarks --bench ublk_overlaybd
 
 bench-orchestrator-store:
-	$(CARGO) bench --bench orchestrator_store
+	$(CARGO) bench -p agentenv-benchmarks --bench orchestrator_store
 
 OCI_IMAGE ?=
 bench-oci-conversion:
-	$(if $(OCI_IMAGE),AGENTENV_BENCH_OCI_IMAGE="$(OCI_IMAGE)") $(CARGO) bench --bench oci_conversion_pipeline
+	$(if $(OCI_IMAGE),AGENTENV_BENCH_OCI_IMAGE="$(OCI_IMAGE)") $(CARGO) bench -p agentenv-benchmarks --bench oci_conversion_pipeline
 
 ci-deps:
 	$(MAKE) ci-deps-protoc
