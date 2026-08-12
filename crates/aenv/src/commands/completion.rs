@@ -3,8 +3,15 @@ use anyhow::Result;
 use clap::Args as ClapArgs;
 use clap::CommandFactory;
 use clap::ValueEnum;
+use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
 use clap_complete::Shell as ClapShell;
 use std::io::Write;
+use std::time::Duration;
+
+use crate::client::sandboxes::ListedSandbox;
+
+const DYNAMIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
+const DYNAMIC_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Shell to generate completion for.
 ///
@@ -37,6 +44,70 @@ pub fn run(args: Args) -> Result<()> {
     write_completion(args.shell, &mut std::io::stdout().lock())
 }
 
+pub fn running_sandbox_candidates() -> Vec<CompletionCandidate> {
+    sandbox_candidates(|state| state == Some("running"))
+}
+
+pub fn paused_sandbox_candidates() -> Vec<CompletionCandidate> {
+    sandbox_candidates(|state| state == Some("paused"))
+}
+
+pub fn active_sandbox_candidates() -> Vec<CompletionCandidate> {
+    sandbox_candidates(|state| matches!(state, Some("running") | Some("paused")))
+}
+
+fn sandbox_candidates<F>(state_matches: F) -> Vec<CompletionCandidate>
+where
+    F: Fn(Option<&str>) -> bool,
+{
+    let Ok(credentials) = crate::auth::load() else {
+        return Vec::new();
+    };
+    let Ok(client) = crate::client::Client::new_with_timeouts(
+        &credentials.url,
+        &credentials.api_key,
+        DYNAMIC_CONNECT_TIMEOUT,
+        DYNAMIC_REQUEST_TIMEOUT,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(sandboxes) = client.list_sandboxes() else {
+        return Vec::new();
+    };
+
+    let mut candidates = filter_sandboxes(&sandboxes, state_matches);
+    candidates.sort_by(|left, right| left.sandbox_id.cmp(&right.sandbox_id));
+    candidates
+        .into_iter()
+        .map(|sandbox| CompletionCandidate::new(sandbox.sandbox_id.clone()))
+        .collect()
+}
+
+fn filter_sandboxes<'a, F>(
+    sandboxes: &'a [ListedSandbox],
+    state_matches: F,
+) -> Vec<&'a ListedSandbox>
+where
+    F: Fn(Option<&str>) -> bool,
+{
+    sandboxes
+        .iter()
+        .filter(|sandbox| state_matches(sandbox.state.as_deref()))
+        .collect()
+}
+
+pub fn add_running_sandbox_candidates() -> ArgValueCandidates {
+    ArgValueCandidates::new(running_sandbox_candidates)
+}
+
+pub fn add_paused_sandbox_candidates() -> ArgValueCandidates {
+    ArgValueCandidates::new(paused_sandbox_candidates)
+}
+
+pub fn add_active_sandbox_candidates() -> ArgValueCandidates {
+    ArgValueCandidates::new(active_sandbox_candidates)
+}
+
 /// Generate the completion script for `shell` and write it to `out`.
 ///
 /// Generation goes through an in-memory buffer first: clap_complete's
@@ -60,6 +131,28 @@ fn write_completion<W: Write>(shell: Shell, out: &mut W) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sandbox(id: &str, state: &str) -> ListedSandbox {
+        ListedSandbox {
+            sandbox_id: id.to_string(),
+            template_id: "template".to_string(),
+            alias: None,
+            state: Some(state.to_string()),
+            cpu_count: None,
+            memory_mib: None,
+            disk_size_mib: None,
+            started_at: None,
+            end_at: None,
+        }
+    }
+
+    #[test]
+    fn state_filter_keeps_only_matching_sandboxes() {
+        let sandboxes = [sandbox("paused", "paused"), sandbox("running", "running")];
+        let running = filter_sandboxes(&sandboxes, |state| state == Some("running"));
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].sandbox_id, "running");
+    }
 
     fn generate_for(shell: Shell) -> String {
         let mut buf = Vec::new();

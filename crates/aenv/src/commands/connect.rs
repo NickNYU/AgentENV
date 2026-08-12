@@ -40,6 +40,7 @@ const SANDBOX_LOST_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(ClapArgs)]
 pub struct Args {
+    #[arg(add = crate::commands::completion::add_active_sandbox_candidates())]
     sandbox_id: String,
 }
 

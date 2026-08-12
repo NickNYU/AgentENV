@@ -1,5 +1,6 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::CompleteEnv;
 
 mod auth;
 mod client;
@@ -59,6 +60,7 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Auth => commands::auth::run(),
