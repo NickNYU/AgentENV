@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use crate::client::sandboxes::ListedSandbox;
 
-const DYNAMIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
-const DYNAMIC_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+const DYNAMIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const DYNAMIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Shell to generate completion for.
 ///
@@ -53,7 +53,7 @@ pub fn paused_sandbox_candidates() -> Vec<CompletionCandidate> {
 }
 
 pub fn active_sandbox_candidates() -> Vec<CompletionCandidate> {
-    sandbox_candidates(|state| matches!(state, Some("running") | Some("paused")))
+    sandbox_candidates(|_| true)
 }
 
 fn sandbox_candidates<F>(state_matches: F) -> Vec<CompletionCandidate>
@@ -75,23 +75,21 @@ where
         return Vec::new();
     };
 
-    let mut candidates = filter_sandboxes(&sandboxes, state_matches);
+    let mut candidates = filter_sandboxes(sandboxes, state_matches);
     candidates.sort_by(|left, right| left.sandbox_id.cmp(&right.sandbox_id));
     candidates
         .into_iter()
-        .map(|sandbox| CompletionCandidate::new(sandbox.sandbox_id.clone()))
+        .map(|sandbox| CompletionCandidate::new(sandbox.sandbox_id))
         .collect()
 }
 
-fn filter_sandboxes<'a, F>(
-    sandboxes: &'a [ListedSandbox],
-    state_matches: F,
-) -> Vec<&'a ListedSandbox>
+fn filter_sandboxes<I, F>(sandboxes: I, state_matches: F) -> Vec<ListedSandbox>
 where
+    I: IntoIterator<Item = ListedSandbox>,
     F: Fn(Option<&str>) -> bool,
 {
     sandboxes
-        .iter()
+        .into_iter()
         .filter(|sandbox| state_matches(sandbox.state.as_deref()))
         .collect()
 }
@@ -149,7 +147,7 @@ mod tests {
     #[test]
     fn state_filter_keeps_only_matching_sandboxes() {
         let sandboxes = [sandbox("paused", "paused"), sandbox("running", "running")];
-        let running = filter_sandboxes(&sandboxes, |state| state == Some("running"));
+        let running = filter_sandboxes(sandboxes, |state| state == Some("running"));
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].sandbox_id, "running");
     }
