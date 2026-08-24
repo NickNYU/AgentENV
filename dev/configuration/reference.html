@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-f7fc3e87.js";
+            window.path_to_searchindex_js = "../searchindex-0b68ea43.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-795efd7f.js"></script>
+        <script src="../toc-5437f69c.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -388,7 +388,7 @@ eviction.</p>
 <tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>max_size_gb</code></td><td>integer</td><td><code>10</code></td><td>Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd <code>cacheConfig.cacheSizeGB</code></td></tr>
+<tr><td><code>max_size_gb</code></td><td>integer</td><td><code>100</code></td><td>Maximum size of the overlaybd remote block cache in GiB. This value is written to generated overlaybd <code>cacheConfig.cacheSizeGB</code></td></tr>
 </tbody>
 </table>
 </div>
@@ -481,6 +481,20 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 </tbody>
 </table>
 </div>
+<h2 id="sandbox"><a class="header" href="#sandbox"><code>[sandbox]</code></a></h2>
+<p>Sandbox control communication settings.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>access_token_hash_seed</code></td><td>string</td><td>auto-generated</td><td>Optional override for the secret used to derive sandbox envd and traffic access tokens. When unset, normal server startup creates and reuses <code>$AENV_HOME/secrets/sandbox-access-token-hash-seed</code>. Configure an explicit shared value for clustered deployments.</td></tr>
+</tbody>
+</table>
+</div>
+<p>The managed seed is node-local persistent state and must be included in backups of <code>$AENV_HOME</code>. AgentENV refuses to generate a replacement when persisted secure or private-ingress sandboxes exist. An explicit environment or TOML value takes precedence over the managed file; changing that effective value invalidates existing sandbox access tokens.</p>
+<p>Configure <code>AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED</code> with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.</p>
 <h2 id="orchestrator"><a class="header" href="#orchestrator"><code>[orchestrator]</code></a></h2>
 <p>Sandbox lifecycle management.</p>
 <div class="table-wrapper">
@@ -518,7 +532,7 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 <tbody>
 <tr><td><code>[pool.network]</code></td><td><code>maintenance_enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the background network-slot maintenance worker</td></tr>
 <tr><td><code>[pool.block]</code></td><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the ublk overlaybd warm-device pool</td></tr>
-<tr><td><code>[pool.block]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td><code>true</code></td><td>Prewarm block devices after the first reusable image shape is known</td></tr>
+<tr><td><code>[pool.block]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td>capability-based</td><td>Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports <code>UBLK_F_UPDATE_SIZE</code>; an explicit value overrides detection</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable pre-spawned Firecracker processes for snapshot resume</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>maintenance_enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable the background Firecracker process maintenance worker</td></tr>
 <tr><td><code>[pool.firecracker]</code></td><td><code>startup_prewarm</code></td><td>boolean</td><td><code>true</code></td><td>Spawn warm Firecracker entries up to the low watermark during server startup</td></tr>
@@ -592,7 +606,13 @@ and scheduler heartbeats.</p>
 </table>
 </div>
 <h2 id="p2p"><a class="header" href="#p2p"><code>[p2p]</code></a></h2>
-<p>Project-wide artifact transport configuration. The transport is disabled by default. When enabled, it is used by the overlaybd P2P HTTP facade and by snapshot publication/runtime resolution as an optional artifact visibility and acceleration path.</p>
+<blockquote>
+<p><strong>Experimental:</strong> P2P has not been tested in production. Keep it disabled in
+production unless the deployment accepts that operational risk.</p>
+</blockquote>
+<p>Project-wide artifact transport configuration. The transport is disabled by
+default. When enabled, it is used by the overlaybd P2P HTTP facade and by
+snapshot publication/runtime resolution as an optional acceleration path.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -684,6 +704,7 @@ and scheduler heartbeats.</p>
 <tr><td><code>access_key_secret</code></td><td>string</td><td>unset</td><td>Static OSS access key secret. Required when <code>credential_process</code> is not set</td></tr>
 <tr><td><code>security_token</code></td><td>string</td><td>unset</td><td>Optional session token paired with static access key credentials</td></tr>
 <tr><td><code>region</code></td><td>string</td><td>none</td><td>Region passed to the S3-compatible object-store client; required for current OSS backend</td></tr>
+<tr><td><code>addressing_style</code></td><td>string</td><td>auto-detect</td><td>Bucket addressing style, <code>"virtual"</code> or <code>"path"</code>. When unset, the backend auto-detects: Alibaba OSS and bucket-in-endpoint hosts use virtual-host style, other endpoints default to path style. Set either value when a provider’s required or preferred style differs from the detected default</td></tr>
 <tr><td><code>cache_max_size_gb</code></td><td>integer</td><td><code>10</code></td><td>Maximum size of the node-local OSS artifact cache in GiB</td></tr>
 </tbody>
 </table>
@@ -693,7 +714,16 @@ and scheduler heartbeats.</p>
 <li><code>credential_process</code> and static access key settings are mutually exclusive in practice; when <code>credential_process</code> is set, the backend ignores static credential fields.</li>
 <li><code>credential_process</code> should be written as a portable argv-style command line. Avoid <code>$VAR</code>, backticks, <code>$(...)</code>, pipes, and shell builtins.</li>
 <li>Although the config section is still named <code>oss</code>, the runtime path is implemented via a shared S3-compatible client, so <code>region</code> must be configured.</li>
+<li>Leave <code>addressing_style</code> unset when endpoint-based detection is correct. Set it to <code>"virtual"</code> or <code>"path"</code> when the provider’s required or preferred style differs from the detected default; for example, some Tigris or Cloudflare R2 deployments use virtual-host addressing.</li>
+<li>The setting covers both halves of the data path: the snapshot repository client (metadata and artifact upload/download) and the generated OverlayBD runtime config (<code>ossConfig.defaultAddressingStyle</code>), which the runtime uses when reading remote managed snapshot layers during sandbox restore.</li>
 </ul>
+<p>For an S3-compatible provider where virtual-host addressing is required or preferred — for example <a href="https://www.tigrisdata.com/docs/">Tigris</a> — set <code>addressing_style</code> explicitly:</p>
+<pre><code class="language-toml">[backend.oss]
+endpoint = "https://t3.storage.dev"
+bucket = "agentenv-snapshots"
+region = "auto"
+addressing_style = "virtual"
+</code></pre>
 <p>Other path override:</p>
 <ul>
 <li><code>AENV_DEPS_PATH</code></li>
@@ -717,19 +747,17 @@ host sysctls; otherwise configure these kernel parameters on the host.</p>
 </table>
 </div>
 <h2 id="ublk"><a class="header" href="#ublk"><code>[ublk]</code></a></h2>
-<p>Optional userspace block device configuration. When enabled, rootfs is served through a ublk device instead of a plain file, managed by <code>uvm-ublk-daemon</code>.</p>
+<p>Userspace block device configuration. Rootfs is served through an OverlayBD-backed ublk device managed by <code>uvm-ublk-daemon</code>.</p>
 <div class="table-wrapper">
 <table>
 <thead>
 <tr><th>Key</th><th>Type</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>enabled</code></td><td>boolean</td><td><code>true</code></td><td>Enable ublk-backed rootfs</td></tr>
 <tr><td><code>daemon_binary_path</code></td><td>string</td><td><code>"$AENV_HOME/ublk/uvm-ublk-daemon"</code></td><td>Path to the <code>uvm-ublk-daemon</code> binary</td></tr>
 <tr><td><code>daemon_socket_path</code></td><td>string</td><td><code>"$AENV_RUNTIME/ublk-daemon.sock"</code></td><td>Unix socket path used by the daemon</td></tr>
 <tr><td><code>daemon_log_path</code></td><td>string</td><td><code>"$AENV_HOME/logs/ublk-daemon.log"</code></td><td>File path for daemon logs; deployments are responsible for rotation and retention</td></tr>
 <tr><td><code>daemon_metrics_listen_addr</code></td><td>string</td><td><code>"0.0.0.0:9103"</code></td><td>HTTP listen address for daemon Prometheus metrics; empty string disables it</td></tr>
-<tr><td><code>device_type</code></td><td>string</td><td><code>"overlaybd"</code></td><td><code>"cow"</code> (copy-on-write) or <code>"overlaybd"</code> (layered image)</td></tr>
 </tbody>
 </table>
 </div>
@@ -739,7 +767,7 @@ host sysctls; otherwise configure these kernel parameters on the host.</p>
 <li><code>AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR</code></li>
 </ul>
 <h2 id="ublkoverlaybd"><a class="header" href="#ublkoverlaybd"><code>[ublk.overlaybd]</code></a></h2>
-<p>Overlaybd-specific configuration used when <code>ublk.device_type = "overlaybd"</code>.</p>
+<p>OverlayBD configuration for ublk. Legacy <code>enabled</code> and <code>device_type</code> keys are ignored.</p>
 <div class="table-wrapper">
 <table>
 <thead>
@@ -779,8 +807,7 @@ the default path on every startup.</p>
 </thead>
 <tbody>
 <tr><td><code>overlaybd_global_config_path</code></td><td>string</td><td><code>"$AENV_HOME/overlaybd/mem-overlaybd-global.json"</code></td><td>Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file.</td></tr>
-<tr><td><code>direct_overlaybd</code></td><td>bool</td><td><code>true</code></td><td>Create memory overlaybd layers directly from Firecracker dirty memory ranges via <code>process_vm_readv</code>, skipping the intermediate <code>mem.bin</code> file. Set <code>AGENTENV_MEMORY_SNAPSHOT_DIRECT_OVERLAYBD=false</code> to force the legacy <code>mem.bin</code> conversion path.</td></tr>
-<tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>false</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. When true, <code>direct_overlaybd</code> must also be <code>true</code>; PVM is temporarily disabled because this combination has not been tested. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=true</code> to enable it.</td></tr>
+<tr><td><code>track_dirty_pages</code></td><td>bool</td><td><code>true</code></td><td>Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set <code>AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false</code> to disable it.</td></tr>
 <tr><td><code>compression_enabled</code></td><td>bool</td><td><code>false</code></td><td>Enable compression for memory snapshot layers. When disabled, <code>compression_algorithm</code> is still parsed but has no effect. This setting affects only memory layers; the physical file name remains <code>overlaybd.commit</code>.</td></tr>
 <tr><td><code>compression_algorithm</code></td><td>string</td><td><code>"lz4"</code></td><td>Compression algorithm for memory snapshot layers. Valid values are only <code>lz4</code> and <code>zstd</code>.</td></tr>
 </tbody>
@@ -882,6 +909,7 @@ and are then re-fetched on demand.</p>
 
         <!-- Custom JS scripts -->
         <script src="../theme/version-selector-067fd7db.js"></script>
+        <script src="../mermaid-init-3bdacd7b.js"></script>
 
 
 
