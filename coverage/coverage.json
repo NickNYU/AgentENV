@@ -5,21 +5,21 @@
     "total": 0
   },
   "functions": {
-    "coverage": "72.47%",
-    "missed": 1372,
-    "total": 4984
+    "coverage": "73.89%",
+    "missed": 1371,
+    "total": 5251
   },
-  "generated_at": "2026-08-23T01:41:51Z",
+  "generated_at": "2026-08-24T02:34:49Z",
   "lines": {
-    "coverage": "76.96%",
-    "missed": 9485,
-    "total": 41170
+    "coverage": "78.04%",
+    "missed": 9657,
+    "total": 43983
   },
   "package": "workspace",
   "regions": {
-    "coverage": "76.12%",
-    "missed": 13796,
-    "total": 57765
+    "coverage": "77.25%",
+    "missed": 14096,
+    "total": 61968
   },
-  "run_url": "https://github.com/NickNYU/AgentENV/actions/runs/32609904789"
+  "run_url": "https://github.com/NickNYU/AgentENV/actions/runs/32682342721"
 }
