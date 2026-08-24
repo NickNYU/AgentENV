@@ -450,21 +450,6 @@ impl FirecrackerInstance {
             .context("Failed to resume microVM")
     }
 
-    /// Creates a snapshot of the microVM.
-    #[tracing::instrument(skip(self), fields(snapshot_path = %snapshot_path.display(), mem_file_path = %mem_file_path.display()))]
-    pub async fn create_snapshot(&self, snapshot_path: &Path, mem_file_path: &Path) -> Result<()> {
-        let mut params = SnapshotCreateParams::new(snapshot_path.to_string_lossy().into_owned());
-        params.mem_file_path = Some(mem_file_path.to_string_lossy().into_owned());
-        // create diff snapshot, when not enable kvm dirty tracking, it will use mincore
-        // internally, to get the present pages and dump as a sparse file.
-        params.snapshot_type =
-            Some(firecracker_client::models::snapshot_create_params::SnapshotType::Diff);
-        self.client
-            .request_no_content(Method::PUT, "/snapshot/create", Some(&params))
-            .await
-            .context("Failed to create snapshot")
-    }
-
     /// Creates a diff snapshot containing VM state only.
     ///
     /// The memory data path is handled by AgentENV through dirty memory ranges.
@@ -626,17 +611,8 @@ fn parse_log_level(level: &str) -> Result<firecracker_client::models::logger::Le
 #[cfg(test)]
 mod tests {
     use super::*;
-    use http_body_util::BodyExt;
-    use hyper::body::Incoming;
-    use hyper::server::conn::http1;
-    use hyper::service::service_fn;
-    use hyper::{Request, Response, StatusCode};
-    use hyper_util::rt::TokioIo;
-    use serde_json::Value;
     use std::process::Command as StdCommand;
     use tempfile::tempdir;
-    use tokio::net::UnixListener;
-    use tokio::sync::mpsc;
 
     #[tokio::test]
     async fn wait_for_ready_times_out_when_socket_never_appears() {
@@ -758,72 +734,14 @@ mod tests {
         let instance = FirecrackerInstance::new(temp.path().to_path_buf());
 
         assert_eq!(
-            instance.resolve_host_path(Path::new("mem.bin")),
-            temp.path().join("mem.bin")
+            instance.resolve_host_path(Path::new("vm_state.bin")),
+            temp.path().join("vm_state.bin")
         );
         assert_eq!(
-            instance.resolve_host_path(Path::new("/tmp/mem.bin")),
-            PathBuf::from("/tmp/mem.bin")
+            instance.resolve_host_path(Path::new("/tmp/vm_state.bin")),
+            PathBuf::from("/tmp/vm_state.bin")
         );
 
-        Ok(())
-    }
-    #[tokio::test]
-    async fn fresh_and_restore_requests_include_track_dirty_pages() -> Result<()> {
-        let temp = tempdir()?;
-        let listener = UnixListener::bind(temp.path().join("firecracker.socket"))?;
-        let (requests_tx, mut requests_rx) = mpsc::unbounded_channel::<(String, Value)>();
-
-        let server = tokio::spawn(async move {
-            for _ in 0..2 {
-                let (stream, _) = listener.accept().await.expect("accept request");
-                let requests_tx = requests_tx.clone();
-                http1::Builder::new()
-                    .keep_alive(false)
-                    .serve_connection(
-                        TokioIo::new(stream),
-                        service_fn(move |request: Request<Incoming>| {
-                            let requests_tx = requests_tx.clone();
-                            async move {
-                                let path = request.uri().path().to_string();
-                                let body =
-                                    request.collect().await.expect("collect request").to_bytes();
-                                let json = serde_json::from_slice(&body).expect("decode request");
-                                requests_tx.send((path, json)).expect("send request");
-                                Ok::<_, std::convert::Infallible>(
-                                    Response::builder()
-                                        .status(StatusCode::NO_CONTENT)
-                                        .body(http_body_util::Full::new(hyper::body::Bytes::new()))
-                                        .expect("build response"),
-                                )
-                            }
-                        }),
-                    )
-                    .await
-                    .expect("serve request");
-            }
-        });
-
-        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
-        instance.set_machine_config(512, 2, false, true).await?;
-        instance
-            .load_snapshot_file(
-                Path::new("vm_state.bin"),
-                Path::new("mem_backend"),
-                &[],
-                false,
-                true,
-            )
-            .await?;
-
-        let (fresh_path, fresh_body) = requests_rx.recv().await.expect("fresh request");
-        let (restore_path, restore_body) = requests_rx.recv().await.expect("restore request");
-        assert_eq!(fresh_path, "/machine-config");
-        assert_eq!(fresh_body["track_dirty_pages"], true);
-        assert_eq!(restore_path, "/snapshot/load");
-        assert_eq!(restore_body["track_dirty_pages"], true);
-
-        server.await.expect("request server");
         Ok(())
     }
 }

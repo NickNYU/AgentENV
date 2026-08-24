@@ -6,12 +6,20 @@ A sandbox is an isolated Firecracker microVM with its own Linux kernel, filesyst
 
 ## Lifecycle
 
-```
-Creating ──> Running ──> Pausing ──> Paused
-                │                      │
-                ├──> Snapshotting      └──> Resuming ──> Running
-                ├──> Forking
-                └──> Killing
+```mermaid
+stateDiagram-v2
+    [*] --> Creating
+    Creating --> Running
+    Running --> Pausing
+    Pausing --> Paused
+    Paused --> Resuming
+    Resuming --> Running
+    Running --> Snapshotting
+    Snapshotting --> Running
+    Running --> Forking
+    Forking --> Running
+    Running --> Killing
+    Killing --> [*]
 ```
 
 | State | Description |
@@ -50,6 +58,8 @@ aenv start --cold ubuntu:24.04
 ```
 
 The cold-start API accepts an optional `diskSizeMB` field to set the root filesystem's virtual size in MiB. Explicit values must be at least 1024 MiB and divisible by 1024 because the current resize tool operates at 1 GiB granularity. Growth is allowed by default; shrinking below the source image size requires `ublk.overlaybd.allow_shrink = true`. If omitted, the image's built-in virtual size is used. Resizing applies only when creating a fresh writable root filesystem, not to read-only images, images with an existing upper, or snapshot resume. Sandbox responses also report disk size as `diskSizeMB`.
+
+Use `aenv start --secure` with either warm or cold starts to require an envd access token for command and file operations. The CLI obtains and sends the token automatically. Secure mode protects the envd control port, while application proxy requests use the independent sandbox-scoped traffic token. Each fork derives distinct envd and traffic credentials from the child sandbox ID.
 
 ---
 
@@ -153,14 +163,31 @@ Each sandbox runs in its own network namespace. By default, outbound internet ac
 curl -X POST \
   -H 'X-API-Key: test-key' \
   -H 'Content-Type: application/json' \
-  -d '{"templateID": "my-ubuntu", "allowInternetAccess": false}' \
+  -d '{"templateID": "my-ubuntu", "allow_internet_access": false}' \
   http://127.0.0.1:8000/sandboxes
 ```
 
-For fine-grained egress control, pass a `network` object when creating the sandbox. Allowed entries take precedence over denied entries:
+For fine-grained egress control, pass a `network` object when creating the sandbox. Within user-configured egress rules, traffic is allow-by-default, and `allowOut` entries take precedence over matching `denyOut` entries. `allowOut` by itself does not create an allowlist: destinations that do not match a deny rule remain reachable.
 
-- `allowOut` — CIDR, IP, or domain patterns
+- `allowOut` — CIDR, IP, or domain pattern. Domain patterns apply to new TCP connections on ports 80 and 443 and require `denyOut: ["0.0.0.0/0"]`. Exact names, `*.example.com`, and `*` are supported; a wildcard does not match the apex domain.
 - `denyOut` — CIDR or IP
+
+The following diagram illustrates how the rules are evaluated:
+
+```mermaid
+flowchart TD
+    A[Destination packet] --> B{Matches allowOut?}
+    B -->|Yes| C[Allow traffic]
+    B -->|No| D{Matches denyOut?}
+    D -->|Yes| E[Reject traffic]
+    D -->|No| F{"allow_internet_access?"}
+    F -->|Yes| C
+    F -->|No| E
+```
+
+`allowOut` is evaluated before `denyOut` in the user egress chain, so an allowed destination can override an overlapping user-configured deny rule. `allow_internet_access: false` sets the base policy to `Deny`, which appends a catch-all reject after those rules and makes the remaining destinations fail closed. Static internal-network deny rules are evaluated before the user egress chain and cannot be overridden by `allowOut`.
+
+To create an allowlist, deny all traffic and then add the allowed exceptions with `allowOut`. You can deny all traffic explicitly with `denyOut: ["0.0.0.0/0"]`, or use `allow_internet_access: false` together with `allowOut`.
 
 ```bash
 curl -X POST \
@@ -169,7 +196,7 @@ curl -X POST \
   -d '{
     "templateID": "my-ubuntu",
     "network": {
-      "allowOut": ["8.8.8.8/32", "example.com", "*.example.com"],
+      "allowOut": ["8.8.8.8/32", "1.1.1.1/32"],
       "denyOut": ["0.0.0.0/0"]
     }
   }' \
@@ -186,7 +213,11 @@ curl -X PUT \
   http://127.0.0.1:8000/sandboxes/<sandbox-id>/network
 ```
 
-Omitting both fields clears all egress rules.
+Omitting both fields clears all per-sandbox egress rules and restores the default allow behavior.
+
+Updating a policy primarily affects new connections; existing connections are not actively terminated. During replacement, the previous policy remains active until the new namespace rules are committed.
+
+For domain rules, the proxy matches the inspected Host/SNI and re-resolves the hostname using the host-side trusted resolver before connecting; the guest's DNS answer and original destination IP are not authoritative for domain policy.
 
 ---
 

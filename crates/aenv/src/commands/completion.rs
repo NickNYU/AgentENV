@@ -1,10 +1,16 @@
 use anyhow::Context;
 use anyhow::Result;
 use clap::Args as ClapArgs;
-use clap::CommandFactory;
 use clap::ValueEnum;
-use clap_complete::Shell as ClapShell;
+use clap_complete::engine::{ArgValueCandidates, CompletionCandidate};
+use clap_complete::env::{Bash, EnvCompleter, Fish, Zsh};
 use std::io::Write;
+use std::time::Duration;
+
+use crate::client::sandboxes::ListedSandbox;
+
+const DYNAMIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+const DYNAMIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Shell to generate completion for.
 ///
@@ -15,12 +21,13 @@ pub enum Shell {
     Fish,
 }
 
-impl From<Shell> for ClapShell {
-    fn from(shell: Shell) -> Self {
-        match shell {
-            Shell::Bash => ClapShell::Bash,
-            Shell::Zsh => ClapShell::Zsh,
-            Shell::Fish => ClapShell::Fish,
+impl Shell {
+    /// The `EnvCompleter` used to emit this shell's registration script.
+    fn completer(self) -> &'static dyn EnvCompleter {
+        match self {
+            Shell::Bash => &Bash,
+            Shell::Zsh => &Zsh,
+            Shell::Fish => &Fish,
         }
     }
 }
@@ -37,19 +44,89 @@ pub fn run(args: Args) -> Result<()> {
     write_completion(args.shell, &mut std::io::stdout().lock())
 }
 
-/// Generate the completion script for `shell` and write it to `out`.
+pub fn running_sandbox_candidates() -> Vec<CompletionCandidate> {
+    sandbox_candidates(|state| state == Some("running"))
+}
+
+pub fn paused_sandbox_candidates() -> Vec<CompletionCandidate> {
+    sandbox_candidates(|state| state == Some("paused"))
+}
+
+pub fn active_sandbox_candidates() -> Vec<CompletionCandidate> {
+    sandbox_candidates(|_| true)
+}
+
+fn sandbox_candidates<F>(state_matches: F) -> Vec<CompletionCandidate>
+where
+    F: Fn(Option<&str>) -> bool,
+{
+    let Ok(credentials) = crate::auth::load() else {
+        return Vec::new();
+    };
+    let Ok(client) = crate::client::Client::new_with_timeouts(
+        &credentials.url,
+        &credentials.api_key,
+        DYNAMIC_CONNECT_TIMEOUT,
+        DYNAMIC_REQUEST_TIMEOUT,
+    ) else {
+        return Vec::new();
+    };
+    let Ok(sandboxes) = client.list_sandboxes() else {
+        return Vec::new();
+    };
+
+    let mut candidates = filter_sandboxes(sandboxes, state_matches);
+    candidates.sort_by(|left, right| left.sandbox_id.cmp(&right.sandbox_id));
+    candidates
+        .into_iter()
+        .map(|sandbox| CompletionCandidate::new(sandbox.sandbox_id))
+        .collect()
+}
+
+fn filter_sandboxes<I, F>(sandboxes: I, state_matches: F) -> Vec<ListedSandbox>
+where
+    I: IntoIterator<Item = ListedSandbox>,
+    F: Fn(Option<&str>) -> bool,
+{
+    sandboxes
+        .into_iter()
+        .filter(|sandbox| state_matches(sandbox.state.as_deref()))
+        .collect()
+}
+
+pub fn add_running_sandbox_candidates() -> ArgValueCandidates {
+    ArgValueCandidates::new(running_sandbox_candidates)
+}
+
+pub fn add_paused_sandbox_candidates() -> ArgValueCandidates {
+    ArgValueCandidates::new(paused_sandbox_candidates)
+}
+
+pub fn add_active_sandbox_candidates() -> ArgValueCandidates {
+    ArgValueCandidates::new(active_sandbox_candidates)
+}
+
+/// Generate the completion registration script for `shell` and write it to
+/// `out`.
 ///
-/// Generation goes through an in-memory buffer first: clap_complete's
-/// generators panic on write errors (`Generator::generate` calls `.expect`),
-/// so writing straight to `out` would turn a closed downstream pipe into a
-/// panic. The buffer cannot fail, so generation is infallible; only the
-/// explicit write below can. A `BrokenPipe` there (e.g. `aenv completion bash
-/// | head`) is normal and treated as success; any other error propagates with
-/// context. Split out from `run` so the write branches are unit-testable.
+/// The emitted script is the dynamic engine's registration: it hooks the
+/// shell so that each completion request calls back into the current `aenv`
+/// binary (`COMPLETE=<shell> aenv -- ...`), which is what evaluates the
+/// dynamic `ArgValueCandidates` providers (e.g. live sandbox IDs). Emitting
+/// the static `clap_complete::generate` script instead would silently disable
+/// those providers, so the two must not be mixed up here.
+///
+/// Generation goes through an in-memory buffer first: the buffer cannot fail,
+/// so registration is infallible; only the explicit write below can. A
+/// `BrokenPipe` there (e.g. `aenv completion bash | head`) is normal and
+/// treated as success; any other error propagates with context. Split out
+/// from `run` so the write branches are unit-testable.
 fn write_completion<W: Write>(shell: Shell, out: &mut W) -> Result<()> {
-    let mut cmd = crate::Cli::command();
     let mut script = Vec::new();
-    clap_complete::generate(ClapShell::from(shell), &mut cmd, "aenv", &mut script);
+    shell
+        .completer()
+        .write_registration("COMPLETE", "aenv", "aenv", "aenv", &mut script)
+        .expect("writing to an in-memory buffer cannot fail");
     match out.write_all(&script).and_then(|_| out.flush()) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
@@ -60,6 +137,29 @@ fn write_completion<W: Write>(shell: Shell, out: &mut W) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
+
+    fn sandbox(id: &str, state: &str) -> ListedSandbox {
+        ListedSandbox {
+            sandbox_id: id.to_string(),
+            template_id: "template".to_string(),
+            alias: None,
+            state: Some(state.to_string()),
+            cpu_count: None,
+            memory_mib: None,
+            disk_size_mib: None,
+            started_at: None,
+            end_at: None,
+        }
+    }
+
+    #[test]
+    fn state_filter_keeps_only_matching_sandboxes() {
+        let sandboxes = [sandbox("paused", "paused"), sandbox("running", "running")];
+        let running = filter_sandboxes(sandboxes, |state| state == Some("running"));
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].sandbox_id, "running");
+    }
 
     fn generate_for(shell: Shell) -> String {
         let mut buf = Vec::new();
@@ -88,30 +188,41 @@ mod tests {
         }
     }
 
+    // The registration scripts below must route completion requests back into
+    // the `aenv` binary via the `COMPLETE=<shell>` environment variable: that
+    // callback is what makes the dynamic `ArgValueCandidates` providers (live
+    // sandbox IDs) reachable. A static script would contain the same command
+    // tree but never invoke the binary at completion time.
+
     #[test]
-    fn bash_has_compdef_or_complete_f() {
+    fn bash_registers_dynamic_callback() {
         let s = generate_for(Shell::Bash);
         assert!(
-            s.contains("complete -F") || s.contains("compdef"),
-            "bash output should register the binary; got:\n{s}"
+            s.contains("_clap_complete_aenv")
+                && s.contains(r#"COMPLETE="bash""#)
+                && s.contains(r#""aenv" --"#),
+            "bash output should register a callback into the aenv binary; got:\n{s}"
         );
     }
 
     #[test]
-    fn zsh_has_compdef_header() {
+    fn zsh_registers_dynamic_callback() {
         let s = generate_for(Shell::Zsh);
         assert!(
-            s.starts_with("#compdef"),
-            "zsh output should start with a #compdef header; got:\n{s}"
+            s.starts_with("#compdef aenv")
+                && s.contains("_clap_dynamic_completer_aenv")
+                && s.contains(r#"COMPLETE="zsh""#),
+            "zsh output should register a callback into the aenv binary; got:\n{s}"
         );
     }
 
     #[test]
-    fn fish_has_complete_calls() {
+    fn fish_registers_dynamic_callback() {
         let s = generate_for(Shell::Fish);
         assert!(
-            s.contains("complete "),
-            "fish output should contain `complete` invocations; got:\n{s}"
+            s.contains("complete --keep-order --exclusive --command aenv")
+                && s.contains("COMPLETE=fish aenv"),
+            "fish output should register a callback into the aenv binary; got:\n{s}"
         );
     }
 

@@ -1,7 +1,9 @@
 # PVM Deployment
 
+> [!NOTE]
 > **Use this guide when standard KVM is unavailable**, which commonly happens on cloud VMs where nested virtualization is not exposed. If standard KVM already works, use the [Quick Start](../getting-started/quickstart.md) instead.
 
+> [!WARNING]
 > This feature is **EXPERIMENTAL**. The PVM feature has not yet been merged into the mainline Linux kernel, and the forked kernel may not receive the same level of testing and security updates as the mainline kernel.
 
 PVM, originally proposed in the paper [*PVM: Efficient Shadow Paging for Deploying Secure Containers in Cloud-native Environment*](https://dl.acm.org/doi/10.1145/3600006.3613158), is an alternative virtualization mode that can provide the KVM-compatible interface required by AgentENV without relying on conventional nested virtualization. After the PVM host environment is installed, AgentENV still uses `/dev/kvm` to create Firecracker microVMs.
@@ -27,6 +29,7 @@ You need:
 
 AgentENV does **not** replace the running host kernel automatically. Prebuilt PVM host-kernel packages are published separately in the [`kvcache-ai/linux` releases](https://github.com/kvcache-ai/linux/releases). You must install the appropriate package, reboot into that kernel, and verify the PVM module before installing AgentENV.
 
+> [!WARNING]
 > Before changing kernels on a production server, confirm that you have console access or another recovery path in case the new kernel does not boot.
 
 ## Host and Guest Kernel Compatibility
@@ -194,7 +197,7 @@ Use the dedicated PVM image:
 ```bash
 docker pull ghcr.io/kvcache-ai/aenv-server:latest-pvm
 
-docker run --rm -it \
+docker run --rm -it --name aenv-server \
   --device /dev/kvm \
   --privileged \
   -v /dev:/dev \
@@ -215,6 +218,9 @@ cargo run --bin server -- --setup-only
 make start-server
 ```
 
+The server generates and persists the API key under
+`$AENV_HOME/secrets/api-key` on its first normal startup.
+
 You can also set the mode in the TOML configuration:
 
 ```toml
@@ -223,7 +229,7 @@ virtualization_mode = "pvm"
 
 The environment variable takes precedence over the TOML value.
 
-Memory snapshot dirty-page tracking (`memory_snapshot.track_dirty_pages = true`) is temporarily disabled in PVM mode because this combination has not been tested.
+Memory snapshot dirty-page tracking is enabled by default for KVM and automatically disabled in PVM mode because this combination has not been tested.
 
 To build a PVM Docker image:
 

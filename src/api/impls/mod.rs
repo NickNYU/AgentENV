@@ -1,6 +1,6 @@
 mod admin;
 mod attached_drives;
-mod auth;
+pub(crate) mod auth;
 mod pagination;
 mod sandbox;
 mod snapshots;
@@ -13,6 +13,7 @@ use anyhow::Error as AnyhowError;
 use async_trait::async_trait;
 
 use super::proxy::{build_proxy_client, ProxyClient};
+use crate::api_key::ApiKey;
 use crate::image::ImageResolver;
 use crate::observability::ObservabilityService;
 use crate::orchestrator::Orchestrator;
@@ -33,6 +34,7 @@ pub struct ApiImpl {
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
+    api_key: ApiKey,
 }
 
 impl ApiImpl {
@@ -43,6 +45,7 @@ impl ApiImpl {
         image_resolver: Arc<ImageResolver>,
         observability: Option<Arc<ObservabilityService>>,
         sandbox_proxy_domains: Vec<String>,
+        api_key: ApiKey,
     ) -> Self {
         Self {
             orchestrator,
@@ -52,6 +55,7 @@ impl ApiImpl {
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
+            api_key,
         }
     }
 

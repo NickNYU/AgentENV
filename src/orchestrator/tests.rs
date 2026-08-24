@@ -117,6 +117,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
+        access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
     })
 }
 
@@ -676,6 +677,22 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn managed_seed_continuity_only_applies_to_token_protected_sandboxes() {
+    let public_insecure = SandboxMetadata::default();
+    assert!(!persisted_sandboxes_require_managed_seed(
+        std::slice::from_ref(&public_insecure)
+    ));
+
+    let mut secure = public_insecure.clone();
+    secure.secure = true;
+    assert!(persisted_sandboxes_require_managed_seed(&[secure]));
+
+    let mut private = public_insecure;
+    private.network_policy.allow_public_traffic = false;
+    assert!(persisted_sandboxes_require_managed_seed(&[private]));
+}
+
 #[tokio::test]
 async fn new_returns_error_when_loading_persisted_sandboxes_fails() {
     setup();
@@ -731,6 +748,7 @@ fn resume_launch_plan(sandbox_id: SandboxId) -> LaunchPlan {
         Arc::clone(test_paused_state()),
         NewTimeout::None,
         SandboxResources::default(),
+        None,
     )
 }
 
@@ -1075,6 +1093,7 @@ fn create_request(
         network_policy: SandboxNetworkPolicy::default(),
         custom_extension_params: None,
         auto_resume: false,
+        secure: false,
     }
 }
 
@@ -1136,6 +1155,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             auto_resume: false,
+            secure: false,
         })
         .await?;
 
@@ -1232,6 +1252,7 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
         make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
             .await;
     let initial_policy = SandboxNetworkPolicy::new(
+        false,
         BaseSandboxNetworkPolicy::Deny,
         SandboxNetworkEgressPolicy::new(
             Some(vec!["8.8.8.8".to_string()]),
@@ -1245,11 +1266,17 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
     assert_eq!(created.network_policy, initial_policy);
 
     let updated_policy = SandboxNetworkPolicy::new(
+        true,
+        BaseSandboxNetworkPolicy::Allow,
+        SandboxNetworkEgressPolicy::new(None, Some(vec!["198.51.100.0/24".to_string()]))?,
+    );
+    let expected_policy = SandboxNetworkPolicy::new(
+        false,
         BaseSandboxNetworkPolicy::Allow,
         SandboxNetworkEgressPolicy::new(None, Some(vec!["198.51.100.0/24".to_string()]))?,
     );
     orchestrator
-        .replace_sandbox_network_policy(created.id, updated_policy.clone())
+        .replace_sandbox_network_policy(created.id, updated_policy)
         .await?;
     assert_eq!(behavior.update_network_calls(), 1);
 
@@ -1257,7 +1284,7 @@ async fn sandbox_network_policy_is_applied_and_persisted() -> Result<()> {
         .get_sandbox(&created.id)
         .await?
         .expect("sandbox metadata should exist");
-    assert_eq!(updated.network_policy, updated_policy);
+    assert_eq!(updated.network_policy, expected_policy);
 
     Ok(())
 }
@@ -4435,9 +4462,13 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
     let orchestrator =
         make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
             .await;
-    let source = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "batch-fork-source")]))
-        .await?;
+    let mut request = create_request(Some(60), &[("team", "batch-fork-source")]);
+    request.secure = true;
+    let source = orchestrator.create_sandbox(request).await?;
+    assert!(source.secure);
+    let source_token = orchestrator
+        .get_envd_access_token(&source)
+        .expect("secure source has a token");
     behavior.push_action(
         MockOperation::Build,
         MockAction::Fail {
@@ -4451,12 +4482,20 @@ async fn fork_sandbox_creates_running_children_from_one_source() -> Result<()> {
     let children = outcomes.into_iter().collect::<StdResult<Vec<_>, _>>()?;
 
     assert_eq!(children.len(), 3);
+    let mut child_tokens = Vec::with_capacity(children.len());
     for child in &children {
         assert_ne!(child.id, source.id);
         assert_eq!(child.state, SandboxState::Running);
         assert_eq!(child.snapshot_id, source.snapshot_id);
         assert_eq!(child.user_metadata, source.user_metadata);
         assert_eq!(child.timeout, source.timeout);
+        assert!(child.secure);
+        let child_token = orchestrator
+            .get_envd_access_token(child)
+            .expect("secure child has a token");
+        assert_ne!(child_token, source_token);
+        assert!(!child_tokens.contains(&child_token));
+        child_tokens.push(child_token);
         assert_proxy_ready(&orchestrator, &child.id).await?;
     }
     let source_after = orchestrator

@@ -3,6 +3,7 @@ package gateway
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
@@ -22,6 +23,9 @@ import (
 )
 
 const (
+	headerAPIKey               = "X-API-Key"
+	headerTrafficToken         = "e2b-traffic-access-token"
+	headerEnvdAccessToken      = "X-Access-Token"
 	headerSandboxID            = "x-agentenv-sandbox-id"
 	headerE2BSandboxID         = "e2b-sandbox-id"
 	headerTargetPort           = "x-agentenv-target-port"
@@ -41,6 +45,7 @@ const (
 )
 
 type ServerOptions struct {
+	APIKey                   string
 	RequestTimeout           time.Duration
 	MaxResponseSize          int64
 	DebugMode                bool
@@ -53,6 +58,7 @@ type Server struct {
 	scheduler          schedulerv1.SchedulerClient
 	queryOnlyScheduler schedulerv1.SchedulerClient
 	httpClient         *http.Client
+	apiKey             []byte
 	requestTimeout     time.Duration
 	maxRespSize        int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
@@ -63,6 +69,9 @@ type Server struct {
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
+	if options.APIKey == "" {
+		return nil, errors.New("API key is required")
+	}
 	sandboxProxyDomains, err := normalizeProxyDomains(options.SandboxProxyDomains)
 	if err != nil {
 		return nil, err
@@ -80,6 +89,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		httpClient:          &http.Client{},
 		requestTimeout:      options.RequestTimeout,
 		maxRespSize:         options.MaxResponseSize,
+		apiKey:              []byte(options.APIKey),
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
 	}, nil
@@ -94,11 +104,16 @@ func (s *Server) Handler() http.Handler {
 	// decoding %2F → / and issuing 301 redirects), which breaks proxy
 	// forwarding of percent-encoded path segments such as /files/%2F.
 	core := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/metrics" {
-			http.NotFound(w, r)
+		if isExplicitProxyPath(r.URL.Path) && !hasCompleteProxyRouteHeaders(r.Header) {
+			setGatewayRouteSource(w, routeSourceHeader)
+			if _, hasSandbox := sandboxIDFromHeaders(r.Header); !hasSandbox {
+				http.Error(w, "sandbox id header required", http.StatusBadRequest)
+				return
+			}
+			http.Error(w, "target port header required", http.StatusBadRequest)
 			return
 		}
-		if r.URL.Path == "/health" {
+		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
 			hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
 			if hostRoute != nil || hostRouteErr != nil {
 				s.handleProxy(w, r)
@@ -113,13 +128,20 @@ func (s *Server) Handler() http.Handler {
 				s.handleProxy(w, r)
 				return
 			}
-			// Keep load balancer health checks local when they are not sandbox-routed.
-			w.WriteHeader(http.StatusNoContent)
+			if r.URL.Path == "/health" {
+				// Keep load balancer health checks local when they are not sandbox-routed.
+				w.WriteHeader(http.StatusNoContent)
+			} else {
+				// Gateway Prometheus metrics use the separate metrics listener. Keep
+				// this path unavailable on the public HTTP listener unless it is
+				// explicitly routed to a sandbox.
+				http.NotFound(w, r)
+			}
 			return
 		}
 		s.handleProxy(w, r)
 	})
-	return s.instrumentGatewayHTTP(core)
+	return s.instrumentGatewayHTTP(s.authenticate(core))
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {
@@ -529,6 +551,12 @@ func hasProxyRoutingHeaders(h http.Header) bool {
 	return false
 }
 
+func hasCompleteProxyRouteHeaders(h http.Header) bool {
+	_, hasSandbox := sandboxIDFromHeaders(h)
+	_, hasTargetPort := targetPortFromHeaders(h)
+	return hasSandbox && hasTargetPort
+}
+
 func targetPortFromHeaders(h http.Header) (string, bool) {
 	for _, name := range []string{headerTargetPort, headerE2BTargetPort} {
 		v := strings.TrimSpace(h.Get(name))
@@ -808,4 +836,53 @@ func extractSandboxIDsFromResponse(body []byte) []string {
 		unique = append(unique, id)
 	}
 	return unique
+}
+
+func singleHeaderMatches(headers http.Header, name string, expected []byte) bool {
+	values := headers.Values(name)
+	if len(values) != 1 || len(values[0]) != len(expected) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(values[0]), expected) == 1
+}
+
+func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
+	if isExplicitProxyPath(r.URL.Path) {
+		// The explicit proxy prefix cannot dispatch to a control-plane handler.
+		// Let the core handler return a stable 400 for incomplete routing data.
+		return true
+	}
+
+	hostRoute, err := parseHostRoute(r.Host, s.sandboxProxyDomains)
+	if hostRoute != nil {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+
+	return !isSandboxControlPlaneRequest(r) && hasCompleteProxyRouteHeaders(r.Header)
+}
+
+func isExplicitProxyPath(path string) bool {
+	return path == "/proxy" || strings.HasPrefix(path, "/proxy/")
+}
+
+func (s *Server) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dataPlane := s.isSandboxDataPlaneRequest(r)
+		if dataPlane || r.URL.Path == "/health" || r.URL.Path == "/metrics" {
+			// Sandbox-scoped ingress and envd authorization depend on runtime
+			// metadata and are enforced by the owning runtime node.
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if !singleHeaderMatches(r.Header, headerAPIKey, s.apiKey) {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }

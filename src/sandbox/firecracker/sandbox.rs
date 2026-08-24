@@ -20,8 +20,7 @@ use super::manifest::FirecrackerSnapshotManifest;
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
-    convert_sparse_mem_to_overlaybd, restack_snapshot_overlaybd_device,
-    restack_snapshot_overlaybd_rootfs,
+    restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
 };
 use super::pool::{warm_stderr_path, warm_stdout_path, FirecrackerPool};
 use super::FirecrackerInstance;
@@ -30,9 +29,10 @@ use crate::sandbox::custom_extension::{
 };
 
 use crate::cfg::ConfigManager;
+use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult,
+    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec,
     SandboxRuntimeInfo,
 };
 use crate::sandbox::envd::EnvdInstance;
@@ -229,6 +229,11 @@ impl FirecrackerPausedState {
 }
 
 impl PausedSandboxState for FirecrackerPausedState {
+    fn control_plane_port(&self) -> Option<u16> {
+        let port = self.snapshot_config.common.control_plane_port;
+        (port != 0).then_some(port)
+    }
+
     fn encode(&self) -> Result<serde_json::Value> {
         serde_json::to_value(&self.snapshot_config).context("serialize Firecracker paused state")
     }
@@ -334,7 +339,7 @@ impl SandboxBackend for FirecrackerSandbox {
 
     async fn fork(
         &mut self,
-        child_ids: &[SandboxId],
+        spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>> {
         let snapshot_config = match FirecrackerSandbox::pause(self).await {
             Ok(snapshot_config) => snapshot_config,
@@ -356,12 +361,16 @@ impl SandboxBackend for FirecrackerSandbox {
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
-        let children = child_ids
+        let children = spec
             .iter()
-            .map(|&child_id| {
-                Self::from_snapshot_config_with_id(&snapshot_config, child_id)
-                    .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
-                    .context("build forked sandbox")
+            .map(|child| {
+                Self::from_snapshot_config_with_override(
+                    snapshot_config.clone(),
+                    child.sandbox_id,
+                    child.envd_access_token.clone(),
+                )
+                .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
+                .context("build forked sandbox")
             })
             .collect::<Vec<_>>();
 
@@ -415,7 +424,7 @@ impl SandboxBackend for FirecrackerSandbox {
     }
 
     async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()> {
-        if let Some(slot) = self.network_slot.as_ref() {
+        if let Some(slot) = self.network_slot.as_mut() {
             slot.set_egress_policy(policy.as_ref())
                 .context("configure sandbox network policy")?;
             self.current_network_policy = policy;
@@ -479,21 +488,28 @@ impl FirecrackerSandbox {
     /// Call [`FirecrackerSandbox::start`] or [`FirecrackerSandbox::start_nowait`] to boot it.
     #[tracing::instrument(skip(snapshot))]
     pub fn from_snapshot_config(snapshot: &FirecrackerSnapshotConfig) -> Result<Self> {
-        Self::from_snapshot_config_with_id(snapshot, SandboxId::new())
+        Self::from_snapshot_config_with_override(
+            snapshot.clone(),
+            SandboxId::new(),
+            snapshot.common.envd_access_token.clone(),
+        )
     }
 
-    pub(crate) fn from_snapshot_config_with_id(
-        snapshot: &FirecrackerSnapshotConfig,
+    pub(crate) fn from_snapshot_config_with_override(
+        mut snapshot: FirecrackerSnapshotConfig,
         id: SandboxId,
+        envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Self> {
-        let mut snapshot = snapshot.clone();
-
-        // Ensure the snapshot's MMDS metadata has the correct sandbox ID.
-        snapshot
-            .common
-            .mmds_metadata
-            .get_or_insert_with(|| MmdsMetadata::new(id, "unknown"))
-            .sandbox_id = id.to_string();
+        // Runtime identity and auth override their values in the source snapshot.
+        snapshot.common.envd_access_token = envd_access_token;
+        let FirecrackerCommonConfig {
+            mmds_metadata,
+            envd_access_token,
+            ..
+        } = &mut snapshot.common;
+        let metadata = mmds_metadata.get_or_insert_with(|| MmdsMetadata::new(id, "unknown"));
+        metadata.sandbox_id = id.to_string();
+        metadata.set_access_token(envd_access_token.as_ref());
 
         debug!(
             vm_state_path = %snapshot.vm_state_path.display(),
@@ -528,8 +544,10 @@ impl FirecrackerSandbox {
         let mut snapshot_config = FirecrackerSnapshotConfig::from_runnable_snapshot(snapshot)?;
         snapshot_config.common.mmds_metadata = Some(
             MmdsMetadata::new(launch_config.sandbox_id, launch_config.snapshot_id.clone())
+                .with_access_token(launch_config.envd_access_token.as_ref())
                 .with_extra(launch_config.extra_mmds.clone()),
         );
+        snapshot_config.common.envd_access_token = launch_config.envd_access_token.clone();
         snapshot_config.common.network_policy = launch_config.network.clone();
 
         // Launch-provided custom config overrides the value persisted in the
@@ -714,9 +732,8 @@ impl FirecrackerSandbox {
                 .common()
                 .ublk_config
                 .as_ref()
-                .and_then(|config| match &config.backend {
-                    UblkBackend::Overlaybd(source) => Some(source),
-                    UblkBackend::Cow => None,
+                .map(|config| match &config.backend {
+                    UblkBackend::Overlaybd(source) => source,
                 })
                 .context("overlaybd snapshot requires overlaybd-backed ublk config")?;
             let rootfs_runtime = self
@@ -758,17 +775,15 @@ impl FirecrackerSandbox {
         // Rewrite the overlaybd backend's image config path to point at the snapshot's rootfs.
         // So that the resumed ublk device uses the captured rootfs layers instead of the original ones.
         if let Some(ublk_config) = snapshot_common.ublk_config.as_mut() {
-            if let UblkBackend::Overlaybd(source) = &mut ublk_config.backend {
-                rootfs_read_only = source.read_only;
-                source.image_config_path = base_rootfs_path.clone();
-            }
+            let UblkBackend::Overlaybd(source) = &mut ublk_config.backend;
+            rootfs_read_only = source.read_only;
+            source.image_config_path = base_rootfs_path.clone();
         }
         let runtime_upper_mode = snapshot_common
             .ublk_config
             .as_ref()
-            .and_then(|config| match &config.backend {
-                UblkBackend::Overlaybd(source) => Some(source.runtime_upper_mode),
-                UblkBackend::Cow => None,
+            .map(|config| match &config.backend {
+                UblkBackend::Overlaybd(source) => source.runtime_upper_mode,
             })
             .unwrap_or(overlaybd::config::UpperMode::LogStructured);
         snapshot_common.rootfs_image_config = Some(OverlaybdConfig {
@@ -812,44 +827,22 @@ impl FirecrackerSandbox {
         memory_output: OverlaybdCompactOutput,
     ) -> Result<(PathBuf, u64)> {
         let mem_overlaybd_dir = snapshot_dir.join("mem_overlaybd");
-        let config = ConfigManager::global_config();
-        let use_direct_overlaybd =
-            config.memory_snapshot.direct_overlaybd || self.launch.common().track_dirty_pages;
-        // Persisted dirty sandboxes must keep cumulative direct capture after restart.
-        if use_direct_overlaybd {
-            let firecracker_pid = self.fc_instance.pid()?;
-            self.fc_instance
-                .create_state_only_snapshot(vm_state_path)
-                .await?;
-            // `vm_state.bin` now represents this paused VM state. Any later
-            // error aborts this direct snapshot attempt and is propagated to
-            // the lifecycle caller for recovery.
-            let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
-            convert_dirty_memory_to_overlaybd(
-                firecracker_pid,
-                &dirty_ranges,
-                &mem_overlaybd_dir,
-                memory_output,
-            )
-            .await
-            .context("convert dirty memory ranges to overlaybd layer")
-        } else {
-            let mem_path = snapshot_dir.join("mem.bin");
-            self.fc_instance
-                .create_snapshot(vm_state_path, &mem_path)
-                .await?;
-
-            // Convert the sparse diff mem snapshot to an overlaybd layer.
-            let mem_virtual_size = tokio::fs::metadata(&mem_path)
-                .await
-                .with_context(|| format!("stat mem snapshot: {}", mem_path.display()))?
-                .len();
-            let mem_layer_path =
-                convert_sparse_mem_to_overlaybd(&mem_path, &mem_overlaybd_dir, memory_output)
-                    .await
-                    .context("convert mem snapshot to overlaybd layer")?;
-            Ok((mem_layer_path, mem_virtual_size))
-        }
+        let firecracker_pid = self.fc_instance.pid()?;
+        self.fc_instance
+            .create_state_only_snapshot(vm_state_path)
+            .await?;
+        // `vm_state.bin` now represents this paused VM state. Any later
+        // error aborts this direct snapshot attempt and is propagated to
+        // the lifecycle caller for recovery.
+        let dirty_ranges = self.fc_instance.get_dirty_memory_ranges().await?;
+        convert_dirty_memory_to_overlaybd(
+            firecracker_pid,
+            &dirty_ranges,
+            &mem_overlaybd_dir,
+            memory_output,
+        )
+        .await
+        .context("convert dirty memory ranges to overlaybd layer")
     }
 
     /// Resume a paused sandbox in-place.
@@ -983,14 +976,7 @@ impl FirecrackerSandbox {
     }
 
     fn uses_overlaybd_ublk(&self) -> bool {
-        matches!(
-            self.launch
-                .common()
-                .ublk_config
-                .as_ref()
-                .map(|cfg| &cfg.backend),
-            Some(UblkBackend::Overlaybd(_))
-        )
+        self.launch.common().ublk_config.is_some()
     }
 
     fn mmds_metadata(&self, common: &FirecrackerCommonConfig) -> MmdsMetadata {
@@ -1317,7 +1303,7 @@ impl FirecrackerSandbox {
         let netns = slot.namespace_path();
         self.network_slot = Some(slot);
         self.network_slot
-            .as_ref()
+            .as_mut()
             .expect("network slot was just assigned")
             .set_egress_policy(config.common.network_policy.as_ref())
             .context("Failed to configure sandbox egress policy")?;
@@ -1363,7 +1349,10 @@ impl FirecrackerSandbox {
             "http://{}:{}",
             interaction_ip, config.common.control_plane_port
         );
-        self.envd_instance = Some(EnvdInstance::new(envd_base_url));
+        self.envd_instance = Some(EnvdInstance::new(
+            envd_base_url,
+            config.common.envd_access_token.clone(),
+        ));
 
         // ── Configure microVM: tools drive as rootfs + user image + extras ──
         self.fc_instance
@@ -1390,9 +1379,9 @@ impl FirecrackerSandbox {
         // Fail fast: memory restore requires a ublk device. Check before
         // allocating any resources (Firecracker process, network namespace, …).
         anyhow::ensure!(
-            UblkDeviceManager::global().is_enabled(),
-            "snapshot resume requires ublk to be enabled in config \
-             (memory restore uses a shared ublk device)"
+            UblkDeviceManager::global().is_available(),
+            "snapshot resume requires an available ublk daemon client \
+             because memory restore uses a shared ublk device"
         );
 
         let global_config = ConfigManager::global_config();
@@ -1444,11 +1433,8 @@ impl FirecrackerSandbox {
         self.link_tools_drive(&config.common, fc_cwd)?;
 
         // ── User image: restore overlaybd via ublk ──
-        if let Some(ref ublk_cfg) = config.common.ublk_config {
+        if config.common.ublk_config.is_some() {
             let user_image_symlink = fc_cwd.join(USER_ROOTFS_DRIVE_PATH);
-            let UblkBackend::Overlaybd(_) = &ublk_cfg.backend else {
-                bail!("resume with tools drive requires overlaybd ublk backend");
-            };
             let global_cfg_path = global_config.ublk.overlaybd.global_config_path.clone();
             let runtime_dir = fc_cwd.join("overlaybd");
             let runtime_device = UblkDeviceManager::global()
@@ -1521,7 +1507,7 @@ impl FirecrackerSandbox {
 
             interaction_ip
         };
-        if let Some(slot) = self.network_slot.as_ref() {
+        if let Some(slot) = self.network_slot.as_mut() {
             slot.set_egress_policy(config.common.network_policy.as_ref())
                 .context("Failed to configure sandbox egress policy for resume")?;
         }
@@ -1547,7 +1533,10 @@ impl FirecrackerSandbox {
             "http://{}:{}",
             interaction_ip, config.common.control_plane_port
         );
-        self.envd_instance = Some(EnvdInstance::new(envd_base_url));
+        self.envd_instance = Some(EnvdInstance::new(
+            envd_base_url,
+            config.common.envd_access_token.clone(),
+        ));
 
         let mem_global_config = global_config
             .memory_snapshot
@@ -1831,6 +1820,7 @@ impl FirecrackerSandbox {
                 drive.read_only(),
                 &runtime.image_config_path,
                 &snapshot_dir.join("drives").join(drive.drive_id()),
+                "drive",
             )
             .await
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
@@ -1917,7 +1907,7 @@ async fn copy_cow(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cfg::ToolsConfig;
-    use crate::sandbox::SandboxExecutor;
+    use crate::sandbox::{SandboxAccessTokenGenerator, SandboxExecutor};
     use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
     use std::collections::HashMap;
 
@@ -2093,6 +2083,52 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_config_runtime_identity_replaces_source_auth() -> Result<()> {
+        let source_id = SandboxId::new();
+        let child_id = SandboxId::new();
+        let generator = SandboxAccessTokenGenerator::new("fork-test-seed")?;
+        let source_token = generator.generate(source_id);
+        let child_token = generator.generate(child_id);
+        let mut common = fresh_config().common;
+        common.mmds_metadata =
+            Some(MmdsMetadata::new(source_id, "snapshot").with_access_token(Some(&source_token)));
+        common.envd_access_token = Some(source_token.clone());
+        let snapshot = FirecrackerSnapshotConfig {
+            common,
+            vm_state_path: "snapshot/vm_state.bin".into(),
+            mem_overlaybd_config: OverlaybdConfig {
+                image_config_path: "snapshot/mem_image.json".into(),
+                read_only: true,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            },
+            mem_virtual_size: 4096,
+            managed_snapshot_root: None,
+        };
+
+        let child = FirecrackerSandbox::from_snapshot_config_with_override(
+            snapshot,
+            child_id,
+            Some(child_token.clone()),
+        )?;
+        let common = child.launch.common();
+        let metadata = common.mmds_metadata.as_ref().expect("child MMDS metadata");
+        let expected =
+            MmdsMetadata::new(child_id, "snapshot").with_access_token(Some(&child_token));
+
+        assert_eq!(child.id, child_id);
+        assert_eq!(common.envd_access_token.as_ref(), Some(&child_token));
+        assert_eq!(metadata.sandbox_id, child_id.to_string());
+        assert_eq!(metadata.access_token_hash, expected.access_token_hash);
+        assert_ne!(
+            metadata.access_token_hash,
+            MmdsMetadata::new(source_id, "snapshot")
+                .with_access_token(Some(&source_token))
+                .access_token_hash
+        );
+        Ok(())
+    }
+
+    #[test]
     fn paused_state_without_tools_drive_version_remains_readable_but_not_resumable() -> Result<()> {
         let temp = TempDir::new()?;
         let vm_state_path = temp.path().join("vm-state.bin");
@@ -2171,10 +2207,13 @@ mod tests {
     #[tokio::test]
     async fn stop_without_process_clears_envd_instance() -> Result<()> {
         let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
-        sandbox.envd_instance = Some(EnvdInstance::new(format!(
-            "http://127.0.0.1:{}",
-            ToolsConfig::default().control_plane_port
-        )));
+        sandbox.envd_instance = Some(EnvdInstance::new(
+            format!(
+                "http://127.0.0.1:{}",
+                ToolsConfig::default().control_plane_port
+            ),
+            None,
+        ));
 
         sandbox.stop().await?;
 
@@ -2272,6 +2311,7 @@ mod tests {
             network: None,
             extra_mmds: serde_json::Map::new(),
             custom_extension_params: None,
+            envd_access_token: None,
         };
 
         let snapshot_config =

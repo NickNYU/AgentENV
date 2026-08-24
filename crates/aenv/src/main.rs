@@ -1,5 +1,6 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::CompleteEnv;
 
 mod auth;
 mod client;
@@ -34,6 +35,7 @@ enum Cmd {
     /// Download a file from a sandbox
     Download(commands::download::Args),
     /// Generate shell completion scripts
+    #[command(hide = true)]
     Completion(commands::completion::Args),
     /// Attach an interactive shell to a running sandbox
     #[command(visible_alias = "cn")]
@@ -59,6 +61,7 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Auth => commands::auth::run(),

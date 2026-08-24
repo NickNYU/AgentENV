@@ -25,6 +25,7 @@ Deploy AgentENV across a Kubernetes cluster with a gateway, scheduler, and runti
 - Docker
 - `build-essential` (`sudo apt install -y build-essential`)
 - `kubectl` with Kustomize support
+- shared storage across all runtime nodes, using either POSIXFS or OSS
 
 The provided manifests use standard KVM. To prepare a separate PVM node pool
 when standard KVM is unavailable, see [PVM Deployment](./pvm.md).
@@ -43,6 +44,10 @@ make k8s-build
 
 This builds three images: `agentenv-runtime:latest`, `agentenv-gateway:latest`, and `agentenv-scheduler:latest`.
 
+## Configure the Access-Token Seed (Optional)
+
+See [Secure Sandboxes](../security/secure-sandboxes.md) for the optional shared seed configuration and Kubernetes Secret example.
+
 ## Deploy
 
 ```bash
@@ -55,6 +60,21 @@ make k8s-render
 # Apply to cluster
 make k8s-apply
 ```
+
+`make k8s-apply` generates a 256-bit API key on the first deployment and stores
+it in `Secret/agentenv-auth`. Later applies reuse it. Read the key locally when
+configuring clients:
+
+```bash
+kubectl -n agentenv-system get secret agentenv-auth \
+  -o go-template='{{index .data "AENV_API_KEY" | base64decode}}{{"\n"}}'
+```
+
+Set `AENV_API_KEY` when applying to supply your own value. A standalone
+`make k8s-render` uses an invalid `REDACTED` placeholder so preview output never
+contains a deployable API key. The optional runtime seed keeps its existing
+`agentenv-runtime-secrets` contract described in
+[Secure Sandboxes](../security/secure-sandboxes.md).
 
 To enable host-based sandbox data-plane URLs, set the shared sandbox proxy
 domain variable when rendering or applying manifests:
@@ -95,6 +115,10 @@ make k8s-delete
 ## Local Development (k3s)
 
 A dedicated `local-dev` overlay mounts the repository's `env/` directory directly into the DaemonSet at `/workspace/env`, avoiding runtime asset copies:
+
+The apply helper provisions the same generated API key used by the default
+overlay. The local development overlay retains its fixed test-only runtime seed;
+do not reuse that seed outside local development.
 
 ```bash
 make k8s-build

@@ -93,8 +93,16 @@ if ((${#missing_packages[@]} > 0)); then
         echo "Installing required commands: ${missing_packages[*]} ..."
         sudo apt-get update
         sudo apt-get install -y "${missing_packages[@]}"
+    elif command -v dnf >/dev/null 2>&1; then
+        echo "Installing required commands: ${missing_packages[*]} ..."
+        sudo dnf install -y "${missing_packages[@]}"
+    elif command -v yum >/dev/null 2>&1; then
+        echo "Installing required commands: ${missing_packages[*]} ..."
+        sudo yum install -y "${missing_packages[@]}"
     else
-        echo "error: missing required commands and apt-get is unavailable: ${missing_packages[*]}" >&2
+        echo \
+            "error: missing required commands and no supported package manager is available: ${missing_packages[*]}" \
+            >&2
         exit 1
     fi
 fi
@@ -256,6 +264,7 @@ sudo chmod 0640 "$CONFIG_PATH"
 if [[ -d /run/systemd/system ]]; then
     ENV_FILE_STATUS="exists"
     if [[ ! -f "$ENV_FILE" ]]; then
+        sudo install -o root -g "$SERVICE_GROUP" -m 0640 /dev/null "$ENV_FILE"
         sudo tee "$ENV_FILE" > /dev/null <<EOF
 API_ADDR="127.0.0.1:8000"
 AENV_CONFIG_PATH="${CONFIG_PATH}"
@@ -320,7 +329,7 @@ EOF
         if [[ "$found_virtualization" == "0" ]]; then
             printf 'AENV_VIRTUALIZATION_MODE="%s"\n' "$VIRTUALIZATION_MODE" >> "$tmp_env"
         fi
-        sudo install -m 0644 "$tmp_env" "$ENV_FILE"
+        sudo install -o root -g "$SERVICE_GROUP" -m 0640 "$tmp_env" "$ENV_FILE"
         rm -f "$current_env" "$tmp_env"
         ENV_FILE_STATUS="updated"
     fi
@@ -370,6 +379,7 @@ echo "  CLI    : ${INSTALL_DIR}/aenv"
 echo "  Server : ${INSTALL_DIR}/server"
 echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
+echo "  API key: ${DATA_DIR}/secrets/api-key (auto-generated when no API key is configured)"
 echo "  Mode   : ${VIRTUALIZATION_MODE}"
 if [[ -d /run/systemd/system ]]; then
     if [[ "$ENV_FILE_STATUS" == "written" ]]; then

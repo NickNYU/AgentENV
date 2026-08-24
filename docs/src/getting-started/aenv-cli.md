@@ -27,7 +27,7 @@ Save the server URL and API key. Credentials are stored at `~/.config/aenv/crede
 ```bash
 aenv auth
 # AENV server URL [http://localhost:8000]: The address of the AgentENV server
-# API key: dummy (Any non-empty string works for local development.)
+# API key: <the server's configured or generated API key>
 ```
 
 ---
@@ -52,19 +52,18 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 | `-d, --detach` | Submit the build and return immediately without waiting |
 | `--timeout <SECS>` | Maximum seconds to wait for the build to complete |
 
-### `aenv build <dockerfile>`
+### `aenv build <dockerfile> --name <name>`
 
 Create a template from a local Dockerfile.
 
 ```bash
-aenv build ./Dockerfile
-aenv build ./Dockerfile -t my-app
-aenv build ./Dockerfile --image ghcr.io/myorg/base:latest
+aenv build ./Dockerfile --name my-app
+aenv build ./Dockerfile --name my-app --image ghcr.io/myorg/base:latest
 ```
 
 | Flag | Description |
 |------|-------------|
-| `-t, --tag <name>` | Template name. Defaults to the parent directory name |
+| `--name <name>` | Required template name |
 | `--image <image>` | Override the `FROM` image used as the rootfs base |
 
 ### `aenv template list`
@@ -104,12 +103,14 @@ Start a sandbox and attach an interactive shell. `<target>` is a template name o
 
 ```bash
 aenv start my-ubuntu
+aenv start --secure my-ubuntu               # require token-authenticated envd access
 aenv start --cold ubuntu:24.04              # start directly from an OCI image
 ```
 
 | Flag | Description |
 |------|-------------|
 | `--cold` | Start directly from an external OCI image instead of a template |
+| `--secure` | Require token authentication for envd control communication |
 | `--timeout <secs>` | Sandbox TTL in seconds (default: 300) |
 | `--cpu-count <n>` / `--cpu` | CPU cores — only valid with `--cold` |
 | `--memory-mb <n>` / `--mem` | Memory in MiB — only valid with `--cold` |
@@ -274,68 +275,3 @@ aenv snapshot list --sandbox-id <sandbox-id>
 The table output includes an `IMAGE REF` column (`-` when no image was published); JSON output includes the optional `imageRef` field.
 
 To delete a snapshot, use `aenv template delete <snapshot-id>` or `aenv template delete <name>` — snapshots share the same underlying store as templates and are deleted through the same command.
-
----
-
-## Shell completion
-
-`aenv completion <shell>` prints a shell-completion script for the `aenv` CLI to stdout.
-
-### Generate and install a script
-
-#### Bash
-
-```bash
-mkdir -p ~/.local/share/bash-completion/completions
-aenv completion bash > ~/.local/share/bash-completion/completions/aenv
-```
-
-The Bash completion file is loaded on demand by
-[`bash-completion`](https://github.com/scop/bash-completion).
-This requires `bash-completion` to be installed and initialized in the current
-shell.
-
-#### Zsh
-
-```zsh
-mkdir -p ~/.local/share/zsh/site-functions
-aenv completion zsh > ~/.local/share/zsh/site-functions/_aenv
-```
-
-Zsh loads completion functions from directories listed in `fpath`.
-`~/.local/share/zsh/site-functions` is not included in `fpath` by default on
-all systems. Add the following lines to `~/.zshrc` before any existing
-`compinit` invocation:
-
-```zsh
-fpath=(~/.local/share/zsh/site-functions $fpath)
-autoload -Uz compinit
-compinit
-```
-
-#### Fish
-
-```shell
-mkdir -p ~/.config/fish/completions
-aenv completion fish > ~/.config/fish/completions/aenv.fish
-```
-
-### Activate without installing
-
-To test completion for the current shell session without saving a generated
-file:
-
-```bash
-source <(aenv completion bash)         # Bash
-eval "$(aenv completion zsh)"         # Zsh
-aenv completion fish | source          # Fish
-```
-
-Once loaded, completion covers the CLI surface:
-
-```bash
-aenv <TAB>                       # top-level commands
-aenv snapshot <TAB>              # nested subcommands (create, list, ...)
-aenv list --output <TAB>         # enum values: table, json
-aenv build ./<TAB>               # local path arguments
-```

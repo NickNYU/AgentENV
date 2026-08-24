@@ -11,8 +11,8 @@ use serde::Deserialize;
 use tracing::{debug, info};
 
 use crate::cfg::{
-    AppConfig, OssBackendConfig, OverlaybdDependencyConfig, ResolvedImageCacheConfig,
-    SnapshotRepositoryBackendKind,
+    AppConfig, OssAddressingStyle, OssBackendConfig, OverlaybdDependencyConfig,
+    ResolvedImageCacheConfig, SnapshotRepositoryBackendKind,
 };
 use crate::digest::FileDigest;
 use crate::virtualization::VirtualizationMode;
@@ -744,11 +744,19 @@ fn overlaybd_runtime_oss_config(oss: &OssBackendConfig) -> Result<serde_json::Va
         .filter(|region| !region.is_empty())
         .context("backend.oss.region must be set when generating overlaybd OSS config")?;
     let endpoint = oss.endpoint.trim();
+    let addressing_style = match oss.addressing_style {
+        Some(OssAddressingStyle::Path) => "path",
+        Some(OssAddressingStyle::Virtual) => "virtual",
+        None => "",
+    };
 
     let mut config = serde_json::json!({
         "enable": true,
         "defaultRegion": region,
         "defaultEndpoint": endpoint,
+        // Empty string means the overlaybd runtime auto-detects the style per
+        // endpoint, matching the snapshot repository client's behavior.
+        "defaultAddressingStyle": addressing_style,
     });
 
     match credential_source {
@@ -810,6 +818,7 @@ mod tests {
             access_key_secret: Some(" sk ".to_string()),
             security_token: Some(" token ".to_string()),
             region: Some(" cn-hangzhou ".to_string()),
+            addressing_style: None,
             cache_max_size_gb: Some(4),
         }
     }
@@ -822,10 +831,8 @@ mod tests {
         AppConfig {
             deps_path: root.to_path_buf(),
             ublk: UblkTomlConfig {
-                enabled: true,
                 daemon_binary_path: None,
                 daemon_log_path: None,
-                device_type: "overlaybd".to_string(),
                 overlaybd: UblkOverlaybdTomlConfig {
                     global_config_path: rootfs_global,
                     ..Default::default()
@@ -834,7 +841,6 @@ mod tests {
             },
             memory_snapshot: MemorySnapshotConfig {
                 overlaybd_global_config_path: mem_global,
-                direct_overlaybd: false,
                 ..Default::default()
             },
             ..AppConfig::default()
@@ -866,6 +872,18 @@ mod tests {
             config["defaultEndpoint"],
             "https://oss-cn-hangzhou.aliyuncs.com"
         );
+        assert_eq!(config["defaultAddressingStyle"], "");
+    }
+
+    #[test]
+    fn overlaybd_runtime_oss_config_propagates_addressing_style() {
+        use crate::cfg::OssAddressingStyle;
+
+        let mut oss = sample_oss_config();
+        oss.addressing_style = Some(OssAddressingStyle::Virtual);
+
+        let config = overlaybd_runtime_oss_config(&oss).expect("derive overlaybd oss config");
+        assert_eq!(config["defaultAddressingStyle"], "virtual");
     }
 
     #[test]
@@ -1200,9 +1218,6 @@ mod tests {
         let mut config =
             app_config_with_overlaybd_global_configs(temp.path(), rootfs.clone(), mem.clone());
         config.image.cache.root_dir = temp.path().join("image-cache");
-        config.memory_snapshot.background_download.enable = false;
-        config.memory_snapshot.background_download.block_size = 2 * 1024 * 1024;
-        config.memory_snapshot.background_download.concurrency = 7;
 
         write_generated_overlaybd_global_configs(&config, None).expect("write global configs");
 
@@ -1224,15 +1239,6 @@ mod tests {
                 "memory cacheDir must be distinct from every other cacheDir"
             );
         }
-        let expected_memory = DownloadConfig {
-            enable: false,
-            block_size: 2 * 1024 * 1024,
-            concurrency: 7,
-            ..MemorySnapshotConfig::default()
-                .background_download
-                .to_overlaybd_download_config()
-        };
-        assert_download_json(&memory_value, &expected_memory);
     }
 
     #[test]

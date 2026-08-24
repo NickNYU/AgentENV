@@ -21,6 +21,11 @@
 - [Configuration Reference](./configuration/reference.md)
 - [Environment Variables](./configuration/env-vars.md)
 
+# Security
+
+- [Authentication](./security/authentication.md)
+- [Secure Sandboxes](./security/secure-sandboxes.md)
+
 # Core Concepts
 
 - [How AgentENV Works](./concepts/overview.md)
@@ -47,6 +52,7 @@
 # Developer Internals
 
 - [System Architecture](./internals/architecture.md)
+- [Sandbox Network Architecture](./internals/networking.md)
 - [Sandbox Internals and Testing](./internals/sandbox-testing.md)
 - [Template Builder and Testing](./internals/template-builder-testing.md)
 - [Persistence Artifact Inventory](./internals/persistence-artifact-inventory.md)

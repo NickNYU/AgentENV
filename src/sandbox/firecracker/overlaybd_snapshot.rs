@@ -19,7 +19,6 @@ use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
 use overlaybd::index_file::compact_to;
-use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
 
@@ -470,6 +469,7 @@ async fn capture_live_overlaybd_snapshot(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
+    kind: &'static str,
 ) -> Result<LiveOverlaybdSnapshotState> {
     if read_only {
         debug!(
@@ -504,7 +504,7 @@ async fn capture_live_overlaybd_snapshot(
     };
 
     let descriptor = UblkDeviceManager::global()
-        .restack_snapshot_device(ublk_device, &live_snapshot_layer_path)
+        .restack_snapshot_device(ublk_device, &live_snapshot_layer_path, kind)
         .await
         .context("request overlaybd restack snapshot from ublk device")?;
 
@@ -591,6 +591,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
+    kind: &'static str,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
@@ -601,6 +602,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
         read_only,
         live_runtime_image_config_path,
         output_dir,
+        kind,
     )
     .await?;
 
@@ -625,6 +627,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
         read_only,
         live_runtime_image_config_path,
         &snapshot_root.join("rootfs"),
+        "rootfs",
     )
     .await
 }
@@ -639,10 +642,8 @@ async fn publish_memory_overlaybd_layer(
 ) -> Result<()> {
     let lower_tmp = output_path.with_extension("commit.tmp");
     let build_result = async {
-        let io_ring = shared_transient_io_ring();
         let output_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&lower_tmp, io_ring)
-                .await
+            LocalFile::new(&lower_tmp)
                 .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
         let commit_args = create_commit_args(output_file, mode, concurrency).await?;
@@ -665,70 +666,6 @@ async fn publish_memory_overlaybd_layer(
         let _ = tokio::fs::remove_file(&lower_tmp).await;
     }
     build_result
-}
-
-/// Convert a sparse memory snapshot file into a sealed overlaybd layer.
-///
-/// The sparse file is produced by Firecracker's diff snapshot
-/// (`SnapshotType::Diff`), where only dirty pages contain data and untouched
-/// pages are holes. The parameterized raw packaging path scans the file with
-/// `seek_data`/`seek_hole` and compacts only the data extents.
-///
-/// The input sparse file is removed only after the final layer rename succeeds.
-///
-/// Returns the path to the created overlaybd layer file.
-pub(crate) async fn convert_sparse_mem_to_overlaybd(
-    sparse_mem_path: &Path,
-    output_dir: &Path,
-    mode: OverlaybdCompactOutput,
-) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(output_dir)
-        .await
-        .with_context(|| format!("create mem overlaybd dir: {}", output_dir.display()))?;
-
-    let data_path = output_dir.join("overlaybd.commit");
-    let lower_tmp = data_path.with_extension("commit.tmp");
-    let build_result: Result<()> = async {
-        let io_ring = shared_transient_io_ring();
-        let output_file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::new(&lower_tmp, io_ring)
-                .await
-                .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
-        );
-        let commit_args = create_commit_args(
-            output_file,
-            mode,
-            DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY,
-        )
-        .await?;
-        overlaybd::tools::package_raw_as_overlaybd_with_args(sparse_mem_path, commit_args)
-            .await
-            .context("convert sparse mem.bin to overlaybd layer")?;
-        tokio::fs::rename(&lower_tmp, &data_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "move sealed sparse memory lower into place failed: {}",
-                    data_path.display()
-                )
-            })?;
-        if let Err(error) = tokio::fs::remove_file(sparse_mem_path).await {
-            warn!(
-                mem_path = %sparse_mem_path.display(),
-                error = %error,
-                "failed to remove sparse mem snapshot after overlaybd commit"
-            );
-        }
-        Ok(())
-    }
-    .await;
-
-    if build_result.is_err() {
-        let _ = tokio::fs::remove_file(&lower_tmp).await;
-    }
-    build_result?;
-
-    Ok(data_path)
 }
 
 fn checked_i64_to_u64(value: i64, field: &str) -> Result<u64> {
@@ -852,7 +789,6 @@ mod tests {
     use async_trait::async_trait;
     use bytes::Bytes;
     use firecracker_client::models::DirtyMemoryRange;
-    use overlaybd::index_file::LSMTReadOnlyFile;
     use serde_json::json;
 
     #[test]
@@ -1205,76 +1141,5 @@ mod tests {
             tokio::fs::read(&output).await.expect("read final"),
             existing
         );
-    }
-
-    #[tokio::test]
-    async fn convert_sparse_mem_supports_all_outputs_and_failure_cleanup() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let expected: Vec<u8> = (0..8192).map(|offset| (offset / 4096) as u8).collect();
-
-        for (name, mode, algorithm) in [
-            ("raw", OverlaybdCompactOutput::Raw, None),
-            (
-                "lz4",
-                OverlaybdCompactOutput::ZFile {
-                    algorithm: crate::cfg::MemorySnapshotCompressionAlgorithm::Lz4,
-                    workers: 1,
-                },
-                Some(overlaybd::zfile::CompressOptions::LZ4),
-            ),
-            (
-                "zstd",
-                OverlaybdCompactOutput::ZFile {
-                    algorithm: crate::cfg::MemorySnapshotCompressionAlgorithm::Zstd,
-                    workers: 1,
-                },
-                Some(overlaybd::zfile::CompressOptions::ZSTD),
-            ),
-        ] {
-            let source = temp.path().join(format!("{name}.mem.bin"));
-            tokio::fs::write(&source, &expected)
-                .await
-                .expect("write memory source");
-            let output_dir = temp.path().join(name);
-            let output = convert_sparse_mem_to_overlaybd(&source, &output_dir, mode)
-                .await
-                .expect("publish memory layer");
-
-            let file: Arc<dyn VirtualFile> = Arc::new(
-                LocalFile::open_ro(&output, shared_transient_io_ring())
-                    .await
-                    .expect("open output"),
-            );
-            let file = if let Some(expected_algorithm) = algorithm {
-                let zfile = overlaybd::zfile::zfile_open_ro(file, false)
-                    .await
-                    .expect("open zfile reader");
-                assert_eq!(zfile.options().algo, expected_algorithm);
-                assert_eq!(zfile.options().block_size, 4096);
-                assert_eq!(zfile.options().verify, 0);
-                Arc::new(zfile) as Arc<dyn VirtualFile>
-            } else {
-                file
-            };
-            let layer = LSMTReadOnlyFile::open(file)
-                .await
-                .expect("open logical overlaybd layer");
-            assert_eq!(layer.read_at(0, expected.len()).await.unwrap(), expected);
-            assert!(!source.exists());
-            assert!(!output.with_extension("commit.tmp").exists());
-        }
-
-        let failing_source = temp.path().join("failing.mem.bin");
-        tokio::fs::create_dir(&failing_source)
-            .await
-            .expect("create failing source directory");
-        let output_dir = temp.path().join("failure");
-        convert_sparse_mem_to_overlaybd(&failing_source, &output_dir, OverlaybdCompactOutput::Raw)
-            .await
-            .expect_err("directory source should not package");
-        let output = output_dir.join("overlaybd.commit");
-        assert!(failing_source.exists());
-        assert!(!output.exists());
-        assert!(!output.with_extension("commit.tmp").exists());
     }
 }

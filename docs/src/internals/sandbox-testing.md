@@ -100,8 +100,8 @@ This document describes the public sandbox API, the global `ConfigManager` under
         then waits for guest-level envd readiness.
     - `pause().await`
       - Sends `PATCH /vm` to pause the VM.
-      - Creates snapshot artifacts including `vm_state.bin`, `mem.bin`, the
-        packaged memory image config, and rootfs snapshot state.
+      - Creates snapshot artifacts including `vm_state.bin`, `mem_image.json`,
+        `mem_overlaybd/overlaybd.commit`, and rootfs snapshot state.
       - Returns a `FirecrackerSnapshotConfig` that owns the tempdir holding these files.
     - `resume().await`
       - Resumes a paused VM in-place by sending `PATCH /vm` with `Resumed`.
@@ -293,15 +293,12 @@ enabled = false
   - `snapshot_store`: Committed snapshot store root. Defaults to `$AENV_HOME/snapshot-store`.
 
 - `[ublk]`
-  - `enabled`: Enables ublk-backed rootfs handling.
   - `daemon_binary_path`: Optional path to `uvm-ublk-daemon`.
   - `daemon_socket_path`: Optional unix socket path for daemon RPCs.
   - `daemon_log_path`: Optional log file path for the daemon process.
-  - `device_type`: `cow` or `overlaybd`.
-
 - `[ublk.overlaybd]`
   - `global_config_path`: path to the generated overlaybd runtime config.
-    Required for `overlaybd` device_type. Per-image configs are derived from
+    Required for ublk. Per-image configs are derived from
     template build `fromImage` values and live under
     `<image.cache.root_dir>/configs`.
 
@@ -408,7 +405,8 @@ resumed_sandbox.stop().await?;
 - `microvm_pause_transitions_to_paused`
   Validates pause + snapshot creation by:
   - Pausing a running VM via FC API.
-  - Creating `vm_state.bin` and `mem.bin`.
+  - Creating `vm_state.bin`, `mem_image.json`, and
+    `mem_overlaybd/overlaybd.commit`.
   - Ensuring those files exist on disk.
 
 - `microvm_resume_from_pause_transitions_to_running`

@@ -14,7 +14,9 @@ use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
 use crate::sandbox::ublk::UblkConfig;
 use crate::sandbox::SandboxNetworkPolicy;
 use crate::sandbox::UblkBackend;
-use crate::sandbox::{validate_drive_id, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig};
+use crate::sandbox::{
+    validate_drive_id, EnvdAccessToken, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig,
+};
 use crate::snapshot::RunnableSnapshot;
 use anyhow::{bail, Context, Result};
 use overlaybd::config::UpperMode;
@@ -160,6 +162,10 @@ pub struct FirecrackerCommonConfig {
     /// the process-global config.
     #[serde(default)]
     pub disk_rate_limit: crate::cfg::DiskRateLimitConfig,
+    /// Runtime-only envd credential. It is re-derived from sandbox metadata on
+    /// resume and is intentionally excluded from persisted snapshot configs.
+    #[serde(skip)]
+    pub envd_access_token: Option<EnvdAccessToken>,
 }
 
 impl FirecrackerCommonConfig {
@@ -177,7 +183,7 @@ impl FirecrackerCommonConfig {
             stderr_path: None,
             firecracker_log_level: None,
             runtime_policy,
-            track_dirty_pages: false,
+            track_dirty_pages: true,
             envd_version: EnvdConfig::default().version,
             control_plane_port: ToolsConfig::default().control_plane_port,
             env_vars: None,
@@ -193,6 +199,7 @@ impl FirecrackerCommonConfig {
             network_policy: None,
             custom_extension_params: None,
             disk_rate_limit: crate::cfg::DiskRateLimitConfig::default(),
+            envd_access_token: None,
         }
     }
 
@@ -216,14 +223,6 @@ impl FirecrackerCommonConfig {
             .as_ref()
             .map(|level| level.trim().to_string())
             .filter(|level| !level.is_empty());
-
-        if config.ublk.enabled {
-            match config.ublk.device_type.trim().to_ascii_lowercase().as_str() {
-                "" | "cow" => common.ublk_config = Some(UblkConfig::cow()),
-                "overlaybd" => {}
-                other => bail!("unsupported ublk.device_type: {}", other),
-            };
-        }
 
         Ok(common)
     }
@@ -285,13 +284,12 @@ impl FirecrackerCommonConfig {
             anyhow::bail!("rootfs virtual size must be non-zero");
         }
         if let Some(ublk_config) = &self.ublk_config {
-            if let UblkBackend::Overlaybd(overlaybd_cfg) = &ublk_config.backend {
-                if !overlaybd_cfg.image_config_path.exists() {
-                    anyhow::bail!(
-                        "overlaybd image config not found at {}",
-                        overlaybd_cfg.image_config_path.display()
-                    );
-                }
+            let UblkBackend::Overlaybd(overlaybd_cfg) = &ublk_config.backend;
+            if !overlaybd_cfg.image_config_path.exists() {
+                anyhow::bail!(
+                    "overlaybd image config not found at {}",
+                    overlaybd_cfg.image_config_path.display()
+                );
             }
         }
         Ok(())
@@ -382,13 +380,11 @@ impl FirecrackerSandboxConfig {
 
         let mut common = FirecrackerCommonConfig::from_app_config(config)?;
         common.rootfs_image_config = Some(user_image_config.clone());
-        if ublk.enabled && ublk.device_type.trim().eq_ignore_ascii_case("overlaybd") {
-            common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
-                user_image_config.image_config_path.clone(),
-                user_image_config.read_only,
-                runtime_upper_mode,
-            ));
-        }
+        common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
+            user_image_config.image_config_path.clone(),
+            user_image_config.read_only,
+            runtime_upper_mode,
+        ));
 
         Ok(Self {
             common,
@@ -418,10 +414,12 @@ impl FirecrackerSandboxConfig {
         }
         self.common.mmds_metadata = Some(
             MmdsMetadata::new(launch_config.sandbox_id, launch_config.snapshot_id.clone())
+                .with_access_token(launch_config.envd_access_token.as_ref())
                 .with_extra(launch_config.extra_mmds.clone()),
         );
         self.common.network_policy = launch_config.network.clone();
         self.common.custom_extension_params = launch_config.custom_extension_params.clone();
+        self.common.envd_access_token = launch_config.envd_access_token.clone();
         self
     }
 
@@ -483,9 +481,6 @@ impl FirecrackerSnapshotConfig {
                 snapshot_mode,
                 app_config.virtualization_mode
             );
-        }
-        if !app_config.ublk.enabled {
-            bail!("repository-backed snapshot launch requires ublk to be enabled");
         }
         let tools_drive_version = &snapshot.committed().runtime_versions.tools_drive_version;
         if tools_drive_version.trim().is_empty() {
@@ -699,27 +694,10 @@ mod tests {
     }
 
     #[test]
-    fn common_config_rejects_unsupported_ublk_device_type() {
+    fn from_app_config_does_not_bind_ublk_without_user_image() -> Result<()> {
         let mut config = base_app_config();
         config.ublk = UblkTomlConfig {
-            enabled: true,
             daemon_binary_path: None,
-            device_type: "mystery".to_string(),
-            daemon_log_path: None,
-            ..UblkTomlConfig::default()
-        };
-
-        let err = FirecrackerCommonConfig::from_app_config(&config).expect_err("unsupported ublk");
-        assert!(err.to_string().contains("unsupported ublk.device_type"));
-    }
-
-    #[test]
-    fn from_app_config_accepts_overlaybd_device_type_without_global_image() -> Result<()> {
-        let mut config = base_app_config();
-        config.ublk = UblkTomlConfig {
-            enabled: true,
-            daemon_binary_path: None,
-            device_type: "overlaybd".to_string(),
             daemon_log_path: None,
             overlaybd: UblkOverlaybdTomlConfig {
                 global_config_path: "overlaybd_global.json".into(),
@@ -735,22 +713,10 @@ mod tests {
     }
 
     #[test]
-    fn from_app_config_maps_track_dirty_pages() -> Result<()> {
-        let mut config = base_app_config();
-        config.memory_snapshot.track_dirty_pages = true;
-
-        let common_config = FirecrackerCommonConfig::from_app_config(&config)?;
-        assert!(common_config.track_dirty_pages);
-        Ok(())
-    }
-
-    #[test]
-    fn sandbox_config_binds_overlaybd_device_type_to_user_image() -> Result<()> {
+    fn sandbox_config_binds_overlaybd_to_user_image() -> Result<()> {
         let mut config = base_app_config();
         config.ublk = UblkTomlConfig {
-            enabled: true,
             daemon_binary_path: None,
-            device_type: "overlaybd".to_string(),
             daemon_log_path: None,
             overlaybd: UblkOverlaybdTomlConfig {
                 global_config_path: "overlaybd_global.json".into(),

@@ -145,17 +145,23 @@ impl From<&SandboxNetworkPolicy> for models::SandboxNetworkConfig {
     fn from(policy: &SandboxNetworkPolicy) -> Self {
         let egress = &policy.egress;
         Self {
-            allow_public_traffic: Some(true),
+            allow_public_traffic: Some(policy.allow_public_traffic),
             allow_out: (!egress.allowed_cidrs.is_empty() || !egress.allowed_domains.is_empty())
                 .then(|| {
                     egress
                         .allowed_cidrs
                         .iter()
-                        .chain(egress.allowed_domains.iter())
-                        .cloned()
+                        .map(ToString::to_string)
+                        .chain(egress.allowed_domains.iter().cloned())
                         .collect()
                 }),
-            deny_out: (!egress.denied_cidrs.is_empty()).then(|| egress.denied_cidrs.clone()),
+            deny_out: (!egress.denied_cidrs.is_empty()).then(|| {
+                egress
+                    .denied_cidrs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect()
+            }),
             mask_request_host: None,
         }
     }
@@ -179,10 +185,9 @@ fn allow_internet_access_from_base_policy(policy: BaseSandboxNetworkPolicy) -> N
 
 impl From<SandboxMetadata> for models::SandboxDetail {
     fn from(m: SandboxMetadata) -> Self {
-        let network = m
-            .network_policy
-            .has_explicit_egress_rules()
-            .then(|| models::SandboxNetworkConfig::from(&m.network_policy));
+        let network = (!m.network_policy.allow_public_traffic
+            || m.network_policy.has_explicit_egress_rules())
+        .then(|| models::SandboxNetworkConfig::from(&m.network_policy));
         let allow_internet_access = Some(allow_internet_access_from_base_policy(
             m.network_policy.base_policy,
         ));
@@ -214,7 +219,18 @@ impl From<SandboxMetadata> for models::SandboxDetail {
 
 impl ApiImpl {
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
+        let traffic_access_token = (!metadata.network_policy.allow_public_traffic)
+            .then(|| self.traffic_access_token(metadata.id));
+        let envd_access_token = self
+            .orchestrator
+            .get_envd_access_token(&metadata)
+            .map(|token| token.expose().to_owned());
         let mut sandbox = models::Sandbox::from(metadata);
+        sandbox.envd_access_token = envd_access_token;
+        sandbox.traffic_access_token = Some(match traffic_access_token {
+            Some(token) => Nullable::Present(token),
+            None => Nullable::Null,
+        });
         sandbox.domain = self
             .sandbox_proxy_domains()
             .first()
@@ -223,7 +239,12 @@ impl ApiImpl {
     }
 
     fn sandbox_detail_model(&self, metadata: SandboxMetadata) -> models::SandboxDetail {
+        let envd_access_token = self
+            .orchestrator
+            .get_envd_access_token(&metadata)
+            .map(|token| token.expose().to_owned());
         let mut sandbox = models::SandboxDetail::from(metadata);
+        sandbox.envd_access_token = envd_access_token;
         sandbox.domain = self
             .sandbox_proxy_domains()
             .first()
@@ -354,12 +375,12 @@ fn network_policy_from_create(
     let allow_out = network.and_then(|network| network.allow_out.clone());
     let deny_out = network.and_then(|network| network.deny_out.clone());
     let egress = SandboxNetworkEgressPolicy::new(allow_out, deny_out)?;
-    let policy = SandboxNetworkPolicy::new(base_policy, egress);
-    if policy.has_domain_allow_rules() {
-        anyhow::bail!(
-            "domain entries in allowOut are not supported until TCP egress proxy is enabled"
-        );
-    }
+    let allow_public_traffic = network
+        .and_then(|network| network.allow_public_traffic)
+        .unwrap_or(true);
+    let policy = SandboxNetworkPolicy::new(allow_public_traffic, base_policy, egress);
+    validate_ipv4_cidrs(&policy)?;
+    validate_domain_allowlist(&policy)?;
     Ok(policy)
 }
 
@@ -367,15 +388,45 @@ fn network_policy_from_update(
     body: &models::SandboxNetworkUpdateConfig,
 ) -> anyhow::Result<SandboxNetworkPolicy> {
     let policy = SandboxNetworkEgressPolicy::new(body.allow_out.clone(), body.deny_out.clone())?;
-    if policy.has_domain_allow_rules() {
-        anyhow::bail!(
-            "domain entries in allowOut are not supported until TCP egress proxy is enabled"
-        );
-    }
-    Ok(SandboxNetworkPolicy::new(
+    let policy = SandboxNetworkPolicy::new(
+        true,
         base_policy_from_allow_internet_access(body.allow_internet_access),
         policy,
-    ))
+    );
+    validate_ipv4_cidrs(&policy)?;
+    validate_domain_allowlist(&policy)?;
+    Ok(policy)
+}
+
+fn validate_ipv4_cidrs(policy: &SandboxNetworkPolicy) -> anyhow::Result<()> {
+    if policy
+        .egress
+        .allowed_cidrs
+        .iter()
+        .chain(policy.egress.denied_cidrs.iter())
+        .any(|cidr| matches!(cidr, ipnetwork::IpNetwork::V6(_)))
+    {
+        anyhow::bail!("IPv6 CIDRs are not supported by the sandbox network API");
+    }
+    Ok(())
+}
+
+fn validate_domain_allowlist(policy: &SandboxNetworkPolicy) -> anyhow::Result<()> {
+    use crate::sandbox::ALL_INTERNET_TRAFFIC_CIDR;
+
+    // E2B's domain inspection applies to HTTP/HTTPS (TCP 80/443); other TCP
+    // ports remain CIDR-only. Do not reject a mixed domain/CIDR policy here:
+    // the runtime still honors its explicit CIDR grants on every port.
+    if policy.has_domain_allow_rules()
+        && !policy
+            .egress
+            .denied_cidrs
+            .iter()
+            .any(|cidr| cidr == &ALL_INTERNET_TRAFFIC_CIDR)
+    {
+        anyhow::bail!("allowOut contains domains but denyOut is missing {ALL_INTERNET_TRAFFIC_CIDR} (ALL_TRAFFIC)");
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -493,6 +544,7 @@ impl Sandboxes<()> for ApiImpl {
                 .clone()
                 .filter(|env_vars| !env_vars.is_empty()),
             network_policy,
+            secure: body.secure == Some(true),
             custom_extension_params: custom_params,
         };
 
@@ -625,6 +677,7 @@ impl Sandboxes<()> for ApiImpl {
                 .clone()
                 .filter(|env_vars| !env_vars.is_empty()),
             network_policy,
+            secure: body.secure == Some(true),
             custom_extension_params: custom_params,
         };
 
@@ -1487,8 +1540,28 @@ mod tests {
         let policy = network_policy_from_update(&body).unwrap();
 
         assert_eq!(policy.base_policy, BaseSandboxNetworkPolicy::Deny);
-        assert_eq!(policy.egress.allowed_cidrs, ["8.8.8.8/32"]);
-        assert_eq!(policy.egress.denied_cidrs, ["203.0.113.0/24"]);
+        assert_eq!(
+            policy.egress.allowed_cidrs,
+            vec!["8.8.8.8/32".parse().unwrap()]
+        );
+        assert_eq!(
+            policy.egress.denied_cidrs,
+            vec!["203.0.113.0/24".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn network_create_preserves_private_ingress() {
+        let mut network = models::SandboxNetworkConfig::new();
+        network.allow_public_traffic = Some(false);
+
+        let policy = network_policy_from_create(None, Some(&network)).unwrap();
+
+        assert!(!policy.allow_public_traffic);
+        assert_eq!(
+            models::SandboxNetworkConfig::from(&policy).allow_public_traffic,
+            Some(false)
+        );
     }
 
     #[test]
@@ -1497,5 +1570,81 @@ mod tests {
             .expect("empty update should be valid");
 
         assert_eq!(policy, SandboxNetworkPolicy::default());
+    }
+
+    #[test]
+    fn network_create_accepts_domain_allowlist_with_explicit_deny_all() {
+        let network = models::SandboxNetworkConfig {
+            allow_out: Some(vec!["example.com".to_string()]),
+            deny_out: Some(vec!["0.0.0.0/0".to_string()]),
+            ..models::SandboxNetworkConfig::new()
+        };
+
+        let policy = network_policy_from_create(None, Some(&network)).unwrap();
+        assert_eq!(policy.egress.allowed_domains, ["example.com"]);
+        assert_eq!(
+            policy.egress.denied_cidrs,
+            vec!["0.0.0.0/0".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn network_create_rejects_ipv6_cidrs() {
+        let network = models::SandboxNetworkConfig {
+            allow_out: Some(vec!["2001:db8::/32".to_string()]),
+            ..models::SandboxNetworkConfig::new()
+        };
+
+        let error = network_policy_from_create(None, Some(&network)).unwrap_err();
+        assert!(error.to_string().contains("IPv6 CIDRs"));
+    }
+
+    #[test]
+    fn network_create_rejects_domain_allowlist_without_explicit_deny_all() {
+        let network = models::SandboxNetworkConfig {
+            allow_out: Some(vec!["example.com".to_string()]),
+            ..models::SandboxNetworkConfig::new()
+        };
+
+        let error = network_policy_from_create(None, Some(&network)).unwrap_err();
+        assert!(error.to_string().contains("0.0.0.0/0"));
+    }
+
+    #[test]
+    fn network_update_accepts_domain_allowlist_with_explicit_deny_all() {
+        let body = models::SandboxNetworkUpdateConfig {
+            allow_out: Some(vec!["example.com".to_string()]),
+            deny_out: Some(vec!["0.0.0.0/0".to_string()]),
+            allow_internet_access: None,
+        };
+        let policy = network_policy_from_update(&body).unwrap();
+        assert_eq!(policy.egress.allowed_domains, ["example.com"]);
+        assert_eq!(
+            policy.egress.denied_cidrs,
+            vec!["0.0.0.0/0".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn network_update_rejects_ipv6_cidrs() {
+        let body = models::SandboxNetworkUpdateConfig {
+            allow_out: Some(vec!["2001:db8::/32".to_string()]),
+            deny_out: None,
+            allow_internet_access: None,
+        };
+
+        let error = network_policy_from_update(&body).unwrap_err();
+        assert!(error.to_string().contains("IPv6 CIDRs"));
+    }
+
+    #[test]
+    fn network_update_rejects_domain_allowlist_without_explicit_deny_all() {
+        let body = models::SandboxNetworkUpdateConfig {
+            allow_out: Some(vec!["example.com".to_string()]),
+            deny_out: None,
+            allow_internet_access: None,
+        };
+        let error = network_policy_from_update(&body).unwrap_err();
+        assert!(error.to_string().contains("0.0.0.0/0"));
     }
 }

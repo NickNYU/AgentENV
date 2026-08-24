@@ -1,6 +1,7 @@
 use std::sync::{Arc, RwLock};
 
 use agentenv::api::{server, ApiImpl};
+use agentenv::api_key::ApiKey;
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
@@ -16,6 +17,16 @@ use tracing::{info, warn};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc tuning: purge dirty/muzzy pages after 1s instead of the default
+// 10s, and do the purging on a background thread (the `background_threads`
+// cargo feature is already enabled). Burst allocations (RocksDB opens, image
+// resolution, template builds) otherwise linger as retained RSS long after
+// the burst is over.
+#[used]
+#[allow(non_upper_case_globals)]
+#[export_name = "malloc_conf"]
+pub static malloc_conf: &[u8] = b"dirty_decay_ms:1000,muzzy_decay_ms:1000,background_thread:true\0";
 
 #[derive(Debug, Parser)]
 #[command(name = "agentenv server")]
@@ -68,6 +79,8 @@ async fn main() -> anyhow::Result<()> {
 
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
+
+    let api_key = ApiKey::resolve(config)?;
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let identity = NodeIdentity::from_config(&config.node_identity);
@@ -137,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         image_resolver,
         observability,
         config.sandbox_proxy.domains.clone(),
+        api_key,
     ));
     let app = server::new(api_impl);
     let shutdown_orchestrator = Arc::clone(&orchestrator);

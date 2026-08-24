@@ -10,7 +10,6 @@ use agentenv::sandbox::{
 use anyhow::{bail, Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::ImageConfig;
-use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{is_zfile, zfile_open_ro, CompressOptions};
 
@@ -128,8 +127,7 @@ async fn assert_memory_layer_matches_config(snapshot: &FirecrackerSnapshotConfig
     };
 
     let file: Arc<dyn VirtualFile> = Arc::new(
-        LocalFile::open_ro(&lower_path, shared_transient_io_ring())
-            .await
+        LocalFile::open_ro(&lower_path)
             .with_context(|| format!("open memory lower {}", lower_path.display()))?,
     );
     let zfile_flag = is_zfile(file.clone())
@@ -199,12 +197,11 @@ async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
     Ok(())
 }
 
-/// Shared body of the direct/legacy memory snapshot format tests: pause a
-/// marked sandbox into a temp dir, assert the snapshot artifact layout for the
-/// selected memory snapshot path (`direct` = direct overlaybd), validate the
-/// newest memory lower against the configured compression policy, and verify
-/// that a resume round-trip preserves guest disk state.
-async fn run_memory_snapshot_format_and_resume_case(direct: bool) -> Result<()> {
+/// Shared body of the memory snapshot format test: pause a marked sandbox into
+/// a temp dir, assert the direct OverlayBD snapshot artifact layout, validate
+/// the newest memory lower against the configured compression policy, and
+/// verify that a resume round-trip preserves guest disk state.
+async fn run_memory_snapshot_format_and_resume_case() -> Result<()> {
     let sandbox_config = common::default_sandbox_config()?;
     let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
     sandbox.start().await?;
@@ -220,17 +217,10 @@ async fn run_memory_snapshot_format_and_resume_case(direct: bool) -> Result<()> 
         .path()
         .join("mem_overlaybd/overlaybd.commit")
         .exists());
-    if direct {
-        assert!(snapshot_dir.path().join("mem_image.json").exists());
-    }
+    assert!(snapshot_dir.path().join("mem_image.json").exists());
     assert!(
         !snapshot_dir.path().join("mem.bin").exists(),
-        "{}",
-        if direct {
-            "direct overlaybd snapshot should not create mem.bin"
-        } else {
-            "legacy snapshot should remove mem.bin after overlaybd conversion"
-        }
+        "direct OverlayBD snapshot should not create mem.bin"
     );
     assert_memory_layer_matches_config(&snapshot).await?;
 
@@ -240,38 +230,13 @@ async fn run_memory_snapshot_format_and_resume_case(direct: bool) -> Result<()> 
     Ok(())
 }
 
-/// Direct path (`direct_overlaybd = true`): memory overlaybd layers are built
-/// straight from Firecracker dirty ranges without an intermediate `mem.bin`.
-/// The newest memory lower must match the configured compression policy and
-/// the snapshot must resume with guest state intact. This single test is run
-/// by three independent processes (raw/lz4/zstd temp configs) to cover all
-/// three modes.
+/// Direct OverlayBD memory layers are built from Firecracker memory ranges
+/// without an intermediate raw memory file. This test is run by three
+/// independent processes (raw/lz4/zstd temp configs) to cover all modes.
 #[tokio::test]
 async fn memory_snapshot_format_matches_config_and_resumes() -> Result<()> {
     common::setup().await;
-    let config = agentenv::cfg::ConfigManager::global().config();
-    if !config.memory_snapshot.direct_overlaybd {
-        eprintln!("skipping direct overlaybd integration test; direct_overlaybd is disabled");
-        return Ok(());
-    }
-
-    run_memory_snapshot_format_and_resume_case(true).await
-}
-
-/// Legacy path (`direct_overlaybd = false`): Firecracker first writes a sparse
-/// `mem.bin` diff snapshot, which is converted into a sealed overlaybd layer
-/// and removed after the conversion. Same format/resume assertions as the
-/// direct path; run by the legacy temp-config processes.
-#[tokio::test]
-async fn legacy_memory_snapshot_format_matches_config_and_resumes() -> Result<()> {
-    common::setup().await;
-    let config = agentenv::cfg::ConfigManager::global().config();
-    if config.memory_snapshot.direct_overlaybd {
-        eprintln!("skipping legacy memory snapshot test; direct_overlaybd is enabled");
-        return Ok(());
-    }
-
-    run_memory_snapshot_format_and_resume_case(false).await
+    run_memory_snapshot_format_and_resume_case().await
 }
 
 #[tokio::test]
@@ -530,6 +495,41 @@ async fn assert_tcp_connect(
     Ok(())
 }
 
+async fn assert_curl(
+    sandbox: &mut FirecrackerSandbox,
+    url: &str,
+    should_succeed: bool,
+) -> Result<()> {
+    let output = sandbox
+        .run_command(
+            "curl",
+            &[
+                "--noproxy",
+                "*",
+                "-4",
+                "-sS",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "10",
+                "-o",
+                "/dev/null",
+                "--",
+                url,
+            ],
+        )
+        .await?;
+    assert_eq!(
+        output.exit_code == 0,
+        should_succeed,
+        "curl expectation failed for {url}; exit={}, stdout={}, stderr={}",
+        output.exit_code,
+        output.stdout,
+        output.stderr
+    );
+    Ok(())
+}
+
 async fn test_network(sandbox: &mut FirecrackerSandbox, after_resume: bool) -> Result<()> {
     let checks = [("tcp_ip", "8.8.8.8/53"), ("tcp_dns", "www.baidu.com/443")];
 
@@ -570,6 +570,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
     common::setup().await;
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.common.network_policy = Some(SandboxNetworkPolicy::new(
+        true,
         BaseSandboxNetworkPolicy::Deny,
         SandboxNetworkEgressPolicy::new(Some(vec!["8.8.8.8".to_string()]), None)?,
     ));
@@ -582,6 +583,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
             BaseSandboxNetworkPolicy::Deny,
             SandboxNetworkEgressPolicy::new(Some(vec!["1.1.1.1".to_string()]), None)?,
         )))
@@ -592,6 +594,7 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
             BaseSandboxNetworkPolicy::Allow,
             SandboxNetworkEgressPolicy::new(
                 Some(vec!["8.8.8.8".to_string()]),
@@ -611,11 +614,45 @@ async fn microvm_network_policy_controls_egress() -> Result<()> {
 
     sandbox
         .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
             BaseSandboxNetworkPolicy::Allow,
             SandboxNetworkEgressPolicy::new(Some(vec!["10.0.0.0/8".to_string()]), None)?,
         )))
         .await?;
     assert_tcp_connect(&mut sandbox, "10.255.255.254/80", false).await?;
+
+    sandbox
+        .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
+            BaseSandboxNetworkPolicy::Default,
+            SandboxNetworkEgressPolicy::new(
+                Some(vec!["www.baidu.com".to_string()]),
+                Some(vec!["0.0.0.0/0".to_string()]),
+            )?,
+        )))
+        .await?;
+
+    assert_curl(&mut sandbox, "http://www.baidu.com/", true).await?;
+    assert_curl(&mut sandbox, "https://www.baidu.com/", true).await?;
+    assert_curl(&mut sandbox, "https://www.qq.com/", false).await?;
+
+    sandbox
+        .update_network_policy(Some(SandboxNetworkPolicy::new(
+            true,
+            BaseSandboxNetworkPolicy::Default,
+            SandboxNetworkEgressPolicy::new(
+                Some(vec!["www.qq.com".to_string()]),
+                Some(vec!["0.0.0.0/0".to_string()]),
+            )?,
+        )))
+        .await?;
+
+    assert_curl(&mut sandbox, "https://www.baidu.com/", false).await?;
+    assert_curl(&mut sandbox, "https://www.qq.com/", true).await?;
+
+    sandbox.update_network_policy(None).await?;
+    assert_curl(&mut sandbox, "https://www.baidu.com/", true).await?;
+    assert_curl(&mut sandbox, "https://www.qq.com/", true).await?;
 
     sandbox.stop().await?;
     Ok(())

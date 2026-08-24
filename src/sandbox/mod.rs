@@ -1,3 +1,4 @@
+mod access;
 mod backend;
 pub(crate) mod custom_extension;
 mod envd;
@@ -18,10 +19,11 @@ pub(crate) use custom_extension::{
 use crate::types::{ImageConfigs, SandboxId};
 
 pub use ::envd::process::Signal;
+pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
     CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
-    SandboxForkResult, SandboxRuntimeInfo,
+    SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use extra_drive::{
     normalize_mount_path_for_drive, validate_drive_id, validate_mount_path, validate_sub_path,
@@ -33,7 +35,10 @@ pub use firecracker::{
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
 };
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
-pub use network::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
+pub use network::{
+    BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    ALL_INTERNET_TRAFFIC_CIDR,
+};
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 
@@ -67,6 +72,9 @@ pub struct SandboxLaunchConfig {
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Takes precedence over any value persisted in the source snapshot.
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// Runtime-only credential used by envd. The token is never serialized and
+    /// its Debug representation is redacted.
+    pub envd_access_token: Option<EnvdAccessToken>,
 }
 
 impl SandboxLaunchConfig {
@@ -78,6 +86,7 @@ impl SandboxLaunchConfig {
             network: None,
             extra_mmds: serde_json::Map::new(),
             custom_extension_params: None,
+            envd_access_token: None,
         }
     }
 

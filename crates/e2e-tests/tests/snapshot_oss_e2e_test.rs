@@ -15,7 +15,6 @@ use agentenv_test_support::minio::{MinioFixture, MINIO_PASS, MINIO_USER};
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::index_file::{CommitArgs, LSMTFile};
-use overlaybd::transient_io_ring::shared_transient_io_ring;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
 use sha2::{Digest, Sha256};
@@ -33,13 +32,12 @@ fn test_runtime_versions() -> SnapshotRuntimeVersions {
 /// Write a real ZFile-compressed sealed LSMT layer, mirroring the memory
 /// snapshot output when `[memory_snapshot].compression_enabled = true`.
 async fn write_zfile_memory_lower(path: &Path) -> Result<()> {
-    let io_ring = shared_transient_io_ring();
-    let data = Arc::new(LocalFile::new(path.with_extension("data"), io_ring.clone()).await?);
-    let index = Arc::new(LocalFile::new(path.with_extension("index"), io_ring.clone()).await?);
+    let data = Arc::new(LocalFile::new(path.with_extension("data"))?);
+    let index = Arc::new(LocalFile::new(path.with_extension("index"))?);
     let layer = LSMTFile::create(data, Some(index), 2 * 4096, false).await?;
     layer.write_at(0, &[0x5A; 4096]).await?;
     layer.write_at(4096, &[0xA5; 4096]).await?;
-    let output = Arc::new(LocalFile::new(path, io_ring).await?);
+    let output = Arc::new(LocalFile::new(path)?);
     let compress_args = CompressArgs::new(CompressOptions::new(
         CompressOptions::LZ4,
         CompressOptions::DEFAULT_BLOCK_SIZE,
@@ -95,8 +93,9 @@ fn ensure_test_config() -> Result<()> {
     let deps_path = config_root.join("env");
     let local_cache = config_root.join("snapshot-local-cache");
     std::fs::create_dir_all(&config_root)?;
-    let config_path = workspace_root.join("config").join("oss_default.toml");
+    let config_path = workspace_root.join("config").join("default.toml");
     std::env::set_var("AENV_CONFIG_PATH", &config_path);
+    std::env::set_var("AENV_HOME_PATH", &config_root);
     std::env::set_var("AENV_DEPS_PATH", &deps_path);
     std::env::set_var("AENV_SNAPSHOT_LOCAL_CACHE_PATH", &local_cache);
 
@@ -122,6 +121,7 @@ fn test_oss_config(fixture: &MinioFixture, prefix: &str) -> OssBackendConfig {
         access_key_secret: Some(MINIO_PASS.to_string()),
         security_token: None,
         region: Some(fixture.region.clone()),
+        addressing_style: None,
         cache_max_size_gb: Some(1),
     }
 }

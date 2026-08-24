@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -11,12 +12,50 @@ use object_store_operator::{
 use opendal::{Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
+use tracing::info;
 use url::Url;
 
 use crate::observability::prometheus::MetricGuard;
 
-const CHUNK_SIZE: usize = 8 * 1024 * 1024;
+/// Multipart part size for streaming file uploads. S3/OSS caps a multipart
+/// upload at 10,000 parts, so this bounds the largest uploadable object
+/// (~625 GiB at 64 MiB). Must be passed explicitly to opendal via
+/// `writer_with().chunk()`: without it opendal falls back to the service's
+/// minimum multipart part size (5 MiB), capping uploads at ~50 GiB.
+const CHUNK_SIZE: usize = 64 * 1024 * 1024;
+/// Number of multipart parts uploaded concurrently per file. A single
+/// sequential stream tops out at roughly 100 MB/s to the OSS internal
+/// endpoint; concurrent parts multiply effective throughput.
+const UPLOAD_CONCURRENCY: usize = 8;
 const OSS_OPERATION_DURATION: &str = "agentenv_snapshot_oss_operation_duration_seconds";
+
+/// Snapshot artifacts uploaded to OSS. Used as the `artifact` label on upload
+/// metrics and in upload completion logs so memory layers can be told apart
+/// from rootfs/attached-drive layers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OssUploadArtifact {
+    RootfsLayer,
+    AttachedDriveLayer,
+    MemoryLayer,
+    VmState,
+    FirecrackerManifest,
+    CatalogRecord,
+    Alias,
+}
+
+impl OssUploadArtifact {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::RootfsLayer => "rootfs_layer",
+            Self::AttachedDriveLayer => "attached_drive_layer",
+            Self::MemoryLayer => "memory_layer",
+            Self::VmState => "vm_state",
+            Self::FirecrackerManifest => "manifest",
+            Self::CatalogRecord => "record",
+            Self::Alias => "alias",
+        }
+    }
+}
 
 /// Thin wrapper around the OSS client used by the repository and resolver.
 #[derive(Clone, Debug)]
@@ -34,10 +73,15 @@ impl OssClient {
         region: String,
         prefix: String,
         credential_source: CredentialSource,
+        addressing_override: Option<AddressingStyle>,
     ) -> Result<Self> {
+        // Detection also validates the endpoint URL, so it always runs; an
+        // explicit config override then wins over the detected style.
+        let detected_style = detect_addressing_style(&endpoint, &bucket)?;
+        let addressing_style = addressing_override.unwrap_or(detected_style);
         Ok(Self {
             operator_config: ObjectStoreOperatorConfig {
-                addressing_style: detect_addressing_style(&endpoint, &bucket)?,
+                addressing_style,
                 bucket,
                 endpoint,
                 region,
@@ -147,11 +191,17 @@ impl OssClient {
     }
 
     /// Write small data (catalog JSON, alias JSON, etc.).
-    pub(crate) async fn put_bytes(&self, key: &str, data: impl Into<Bytes>) -> Result<()> {
+    pub(crate) async fn put_bytes(
+        &self,
+        key: &str,
+        data: impl Into<Bytes>,
+        artifact: OssUploadArtifact,
+    ) -> Result<()> {
         let data = data.into();
         let size = data.len() as u64;
         let oss_key = self.full_key(key);
-        let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "put_bytes");
+        let mut metric =
+            MetricGuard::operation_artifact(OSS_OPERATION_DURATION, "put_bytes", artifact.as_str());
         let result = self
             .run_with_operator(|operator| {
                 let data = data.clone();
@@ -165,6 +215,7 @@ impl OssClient {
             metrics::counter!(
                 "agentenv_snapshot_oss_upload_bytes_total",
                 "operation" => "put_bytes",
+                "artifact" => artifact.as_str(),
             )
             .increment(size);
         }
@@ -173,10 +224,17 @@ impl OssClient {
     }
 
     /// Upload a local file to OSS.
-    pub(crate) async fn put_file(&self, key: &str, path: &Path) -> Result<()> {
+    pub(crate) async fn put_file(
+        &self,
+        key: &str,
+        path: &Path,
+        artifact: OssUploadArtifact,
+    ) -> Result<()> {
         let oss_key = self.full_key(key);
         let path = path.to_path_buf();
-        let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "put_file");
+        let mut metric =
+            MetricGuard::operation_artifact(OSS_OPERATION_DURATION, "put_file", artifact.as_str());
+        let start = Instant::now();
         let result: Result<u64> = async {
             let size = tokio::fs::metadata(&path)
                 .await
@@ -198,8 +256,16 @@ impl OssClient {
                 metrics::counter!(
                     "agentenv_snapshot_oss_upload_bytes_total",
                     "operation" => "put_file",
+                    "artifact" => artifact.as_str(),
                 )
                 .increment(size);
+                info!(
+                    key = %oss_key,
+                    artifact = artifact.as_str(),
+                    size_bytes = size,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "oss file uploaded"
+                );
                 Ok(())
             }
             Err(err) => Err(err),
@@ -373,7 +439,11 @@ async fn upload_file_to_operator(
     key: &str,
     path: &Path,
 ) -> opendal::Result<()> {
-    let mut writer = operator.writer(key).await?;
+    let mut writer = operator
+        .writer_with(key)
+        .chunk(CHUNK_SIZE)
+        .concurrent(UPLOAD_CONCURRENCY)
+        .await?;
     let mut file = tokio::fs::File::open(path)
         .await
         .map_err(|err| io_error_to_opendal(err, "open upload source file"))?;
@@ -394,4 +464,54 @@ async fn upload_file_to_operator(
 
 fn io_error_to_opendal(error: std::io::Error, message: &'static str) -> OpenDalError {
     OpenDalError::new(OpenDalErrorKind::Unexpected, message).set_source(error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OssClient;
+    use object_store_operator::{AddressingStyle, CredentialSource};
+
+    #[test]
+    fn explicit_override_takes_precedence_over_detection() {
+        let detected = OssClient::new(
+            "snapshots".to_string(),
+            "https://t3.storage.dev".to_string(),
+            "auto".to_string(),
+            String::new(),
+            CredentialSource::Anonymous,
+            None,
+        )
+        .expect("build client with detected style");
+        assert_eq!(
+            detected.operator_config.addressing_style,
+            AddressingStyle::Path
+        );
+
+        let overridden = OssClient::new(
+            "snapshots".to_string(),
+            "https://t3.storage.dev".to_string(),
+            "auto".to_string(),
+            String::new(),
+            CredentialSource::Anonymous,
+            Some(AddressingStyle::Virtual),
+        )
+        .expect("build client with override");
+        assert_eq!(
+            overridden.operator_config.addressing_style,
+            AddressingStyle::Virtual
+        );
+    }
+
+    #[test]
+    fn explicit_override_still_validates_endpoint() {
+        OssClient::new(
+            "snapshots".to_string(),
+            "not a valid endpoint".to_string(),
+            "auto".to_string(),
+            String::new(),
+            CredentialSource::Anonymous,
+            Some(AddressingStyle::Virtual),
+        )
+        .expect_err("malformed endpoint must fail even with an explicit override");
+    }
 }

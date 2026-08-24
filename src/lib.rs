@@ -1,10 +1,12 @@
 pub mod api;
+pub mod api_key;
 pub mod cfg;
 mod digest;
 pub mod identity;
 pub mod image;
 mod local_store;
 pub mod logging;
+mod managed_secret;
 pub mod observability;
 pub mod orchestrator;
 pub mod overlaybd;
