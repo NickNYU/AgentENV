@@ -135,6 +135,32 @@ impl OssClient {
         result
     }
 
+    /// Reads a small object together with its backend version token for a
+    /// conditional update.
+    pub(crate) async fn get_bytes_with_etag(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+        self.run_with_key(key, |operator, key| async move {
+            for _attempt in 0..5 {
+                let metadata = operator.stat(&key).await?;
+                let etag = metadata.etag().map(str::to_owned);
+                let read = match etag.as_deref() {
+                    Some(etag) => operator.read_with(&key).if_match(etag).await,
+                    None => operator.read(&key).await,
+                };
+                match read {
+                    Ok(bytes) => return Ok((bytes.to_bytes(), etag)),
+                    Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(OpenDalError::new(
+                OpenDalErrorKind::Unexpected,
+                "object changed too often while reading its version",
+            ))
+        })
+        .await
+        .with_context(|| format!("oss get versioned object '{key}'"))
+    }
+
     /// Download an object directly to a local file (atomic: temp + rename).
     pub(crate) async fn get_to_file(&self, key: &str, dest: &Path) -> Result<u64> {
         let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "get_to_file");
@@ -197,6 +223,53 @@ impl OssClient {
             .collect())
     }
 
+    /// Lists at most `limit` files after a repository-relative key.
+    pub(crate) async fn list_keys_page(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let full_prefix = self.full_key(prefix);
+        let full_start_after = start_after.map(|key| self.full_key(key));
+        let keys = self
+            .run_with_operator(|operator| {
+                let full_prefix = full_prefix.clone();
+                let full_start_after = full_start_after.clone();
+                async move {
+                    let builder = operator
+                        .lister_with(&full_prefix)
+                        .recursive(true)
+                        .limit(limit);
+                    let mut lister = match full_start_after.as_deref() {
+                        Some(key) => builder.start_after(key).await?,
+                        None => builder.await?,
+                    };
+                    let mut keys = Vec::with_capacity(limit);
+                    while keys.len() < limit {
+                        let Some(entry) = lister.try_next().await? else {
+                            break;
+                        };
+                        if !entry.metadata().mode().is_dir() {
+                            keys.push(entry.path().to_string());
+                        }
+                    }
+                    Ok(keys)
+                }
+            })
+            .await
+            .with_context(|| format!("oss list page '{prefix}'"))?;
+
+        if self.prefix.is_empty() {
+            return Ok(keys);
+        }
+        let strip = format!("{}/", self.prefix);
+        Ok(keys
+            .into_iter()
+            .map(|key| key.strip_prefix(&strip).unwrap_or(&key).to_string())
+            .collect())
+    }
+
     /// Write small data (catalog JSON, alias JSON, etc.).
     pub(crate) async fn put_bytes(
         &self,
@@ -228,6 +301,37 @@ impl OssClient {
         }
         result?;
         Ok(())
+    }
+
+    /// Conditionally writes a small object. `etag = None` means the object
+    /// must not already exist. A failed condition returns `Ok(false)`.
+    pub(crate) async fn put_bytes_conditionally(
+        &self,
+        key: &str,
+        data: impl Into<Bytes>,
+        etag: Option<&str>,
+    ) -> Result<bool> {
+        let data = data.into();
+        let oss_key = self.full_key(key);
+        self.run_with_operator(|operator| {
+            let data = data.clone();
+            let oss_key = oss_key.clone();
+            let etag = etag.map(str::to_owned);
+            async move {
+                let write = operator.write_with(&oss_key, data);
+                let result = match etag.as_deref() {
+                    Some(etag) => write.if_match(etag).await,
+                    None => write.if_none_match("*").await,
+                };
+                match result {
+                    Ok(_) => Ok(true),
+                    Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => Ok(false),
+                    Err(error) => Err(error),
+                }
+            }
+        })
+        .await
+        .with_context(|| format!("oss conditional put '{key}'"))
     }
 
     /// Upload a local file to OSS.

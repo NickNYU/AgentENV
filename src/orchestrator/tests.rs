@@ -118,6 +118,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
+        volume_manager: None,
     })
 }
 
@@ -1162,12 +1163,15 @@ fn create_request(
 
     CreateSandboxRequest {
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
+        extra_drives: Vec::new(),
+        extra_drives_in_snapshot: false,
         timeout: timeout_secs.map(Duration::from_secs),
         timeout_action: SandboxTimeoutAction::Pause,
         user_metadata,
         env_vars: None,
         network_policy: SandboxNetworkPolicy::default(),
         custom_extension_params: None,
+        volume_mounts: HashMap::new(),
         auto_resume: false,
         secure: false,
     }
@@ -1202,8 +1206,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
         ..Default::default()
     });
     let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
-            .await;
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
     let resources = SandboxResources {
         cpu_count: 2,
         memory_mib: 512,
@@ -1224,12 +1227,15 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
                 extra_boot_args: None,
                 image_configs: Box::new(ImageConfigs::new()),
             },
+            extra_drives: Vec::new(),
+            extra_drives_in_snapshot: false,
             timeout: Some(Duration::from_secs(60)),
             timeout_action: SandboxTimeoutAction::Pause,
             user_metadata: None,
             env_vars: None,
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
+            volume_mounts: HashMap::new(),
             auto_resume: false,
             secure: false,
         })
@@ -2936,8 +2942,7 @@ async fn auto_evict_revalidates_expiry_after_listing() -> Result<()> {
         let cutoff = std::time::SystemTime::now();
         let sandbox_id = SandboxId::new();
         // Inject a renewal immediately before auto-eviction's first metadata
-        // CAS. At that point list_expired has already returned its stale
-        // candidate, so the real eviction entry point must revalidate expiry.
+        // CAS, after list_expired has returned its stale candidate.
         let store = RaceBeforeUpdateStore::new(Duration::from_secs(60));
         store
             .add(SandboxMetadata {
@@ -3121,15 +3126,21 @@ async fn auto_evict_revalidates_later_candidate_after_prior_claim() -> Result<()
 async fn auto_evict_claim_prevents_late_keep_alive_success() -> Result<()> {
     setup();
 
-    for (timeout_action, claimed_state) in [
-        (SandboxTimeoutAction::Pause, SandboxState::Pausing),
-        (SandboxTimeoutAction::Delete, SandboxState::Killing),
+    for (timeout_action, claimed_state, with_volume) in [
+        (SandboxTimeoutAction::Pause, SandboxState::Pausing, false),
+        (SandboxTimeoutAction::Delete, SandboxState::Killing, false),
+        (SandboxTimeoutAction::Delete, SandboxState::Pausing, true),
     ] {
         let control = Arc::new(ScriptedStoreControl::default());
         let orchestrator =
             make_orchestrator_without_background(ScriptedStore::new(control.clone()));
         let mut request = create_request(Some(60), &[]);
         request.timeout_action = timeout_action;
+        if with_volume {
+            request
+                .volume_mounts
+                .insert("/mnt/data".to_owned(), "vol_test".to_owned());
+        }
         let created = orchestrator.create_sandbox(request).await?;
         let sandbox_id = created.id;
 

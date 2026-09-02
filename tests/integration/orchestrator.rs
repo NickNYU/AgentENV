@@ -76,6 +76,8 @@ async fn orchestrator_lifecycle() -> Result<()> {
 
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Snapshot(Box::new(runnable)),
+            extra_drives: Vec::new(),
+            extra_drives_in_snapshot: false,
             timeout: Some(Duration::from_secs(30)),
             timeout_action: SandboxTimeoutAction::Pause,
             user_metadata: Some(
@@ -92,6 +94,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             auto_resume: false,
             custom_extension_params: None,
             secure: true,
+            volume_mounts: std::collections::HashMap::new(),
         };
 
         let created = orchestrator.create_sandbox(request).await?;
@@ -242,6 +245,8 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         let created = orchestrator
             .create_sandbox(CreateSandboxRequest {
                 source: SandboxLaunchSource::Snapshot(Box::new(runnable)),
+                extra_drives: Vec::new(),
+                extra_drives_in_snapshot: false,
                 timeout: Some(Duration::from_secs(30)),
                 timeout_action: SandboxTimeoutAction::Pause,
                 user_metadata: None,
@@ -250,6 +255,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 auto_resume: false,
                 custom_extension_params: None,
                 secure: false,
+                volume_mounts: std::collections::HashMap::new(),
             })
             .await?;
         let sandbox_id = created.id;
@@ -293,6 +299,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                     runtime_versions: capture.metadata.runtime_versions.clone(),
                     virtualization_mode: capture.metadata.virtualization_mode,
                     image_configs: capture.metadata.image_configs.clone(),
+                    volume_snapshots: Vec::new(),
                     custom_extension_params: None,
                 },
                 capture.captured_snapshot,
@@ -336,6 +343,8 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         let relaunched = orchestrator
             .create_sandbox(CreateSandboxRequest {
                 source: SandboxLaunchSource::Snapshot(Box::new(captured_runnable)),
+                extra_drives: Vec::new(),
+                extra_drives_in_snapshot: false,
                 timeout: Some(Duration::from_secs(30)),
                 timeout_action: SandboxTimeoutAction::Pause,
                 user_metadata: None,
@@ -344,6 +353,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 auto_resume: false,
                 custom_extension_params: None,
                 secure: false,
+                volume_mounts: std::collections::HashMap::new(),
             })
             .await?;
         assert_eq!(relaunched.state, SandboxState::Running);

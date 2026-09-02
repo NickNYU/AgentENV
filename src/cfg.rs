@@ -112,6 +112,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub sandbox: SandboxConfig,
     #[config(nested)]
+    pub volume: VolumeConfig,
+    #[config(nested)]
     pub orchestrator: OrchestratorConfig,
     #[config(nested)]
     pub snapshot: SnapshotConfig,
@@ -125,6 +127,8 @@ pub struct AppConfig {
     pub node_identity: NodeIdentityConfig,
     #[config(nested)]
     pub memory_snapshot: MemorySnapshotConfig,
+    #[config(nested)]
+    pub template_build: TemplateBuildConfig,
     #[config(nested)]
     pub pool: PoolTomlConfig,
     #[config(nested)]
@@ -291,6 +295,16 @@ impl std::fmt::Debug for SandboxConfig {
 }
 
 #[derive(Debug, Config, Clone)]
+pub struct VolumeConfig {
+    /// Operator-configured maximum persistent volume size in MiB.
+    #[config(default = 262144u64)]
+    pub max_size_mb: u64,
+    /// Maximum number of persistent volumes a sandbox may mount.
+    #[config(default = 4usize)]
+    pub max_volume_count: usize,
+}
+
+#[derive(Debug, Config, Clone)]
 pub struct MachineConfig {
     #[config(default = 2u32)]
     pub vcpu_count: u32,
@@ -439,7 +453,7 @@ pub struct UblkOverlaybdTomlConfig {
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum MemorySnapshotCompressionAlgorithm {
+pub enum OverlaybdCompressionAlgorithm {
     #[default]
     Lz4,
     Zstd,
@@ -456,13 +470,28 @@ pub struct MemorySnapshotConfig {
     #[config(default = false)]
     pub compression_enabled: bool,
     #[config(default = "lz4")]
-    pub compression_algorithm: MemorySnapshotCompressionAlgorithm,
+    pub compression_algorithm: OverlaybdCompressionAlgorithm,
     /// Number of blocking threads used to compress 4KiB blocks within a
     /// memory layer. 1 = sequential (identical output layout at any value).
     #[config(default = 1)]
     pub compression_workers: usize,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
+}
+
+/// Compression settings applied when a template build captures its snapshot.
+/// Independent of `[memory_snapshot]`: template builds consult only this
+/// section, for both memory layers and the sealed rootfs read-write layer.
+#[derive(Debug, Config, Clone)]
+pub struct TemplateBuildConfig {
+    #[config(default = false)]
+    pub compression_enabled: bool,
+    #[config(default = "lz4")]
+    pub compression_algorithm: OverlaybdCompressionAlgorithm,
+    /// Number of blocking threads used to compress 4KiB blocks within a
+    /// layer. 1 = sequential (identical output layout at any value).
+    #[config(default = 1)]
+    pub compression_workers: usize,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -624,6 +653,7 @@ impl_config_default!(
     SandboxProxyConfig,
     EnvdConfig,
     SandboxConfig,
+    VolumeConfig,
     MachineConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
@@ -930,6 +960,28 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_volume_limits()?;
+        Ok(())
+    }
+
+    fn validate_volume_limits(&self) -> Result<()> {
+        if self.volume.max_size_mb == 0 {
+            bail!("volume.max_size_mb must be greater than 0");
+        }
+        if self.volume.max_size_mb > u64::MAX / (1024 * 1024) {
+            bail!(
+                "volume.max_size_mb must be at most {}",
+                u64::MAX / (1024 * 1024)
+            );
+        }
+        if self.volume.max_volume_count == 0
+            || self.volume.max_volume_count > crate::volume::MAX_VOLUME_MOUNTS
+        {
+            bail!(
+                "volume.max_volume_count must be between 1 and {}",
+                crate::volume::MAX_VOLUME_MOUNTS
+            );
+        }
         Ok(())
     }
 
@@ -1478,6 +1530,29 @@ mod tests {
         config
             .validate()
             .expect("consistent disk rate limit config passes");
+    }
+
+    #[test]
+    fn validate_rejects_invalid_volume_limits() {
+        let mut config = AppConfig::default();
+        config.volume.max_size_mb = 0;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_size_mb"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_volume_count = 0;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_volume_count"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_size_mb = u64::MAX;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_size_mb"));
+
+        let mut config = AppConfig::default();
+        config.volume.max_volume_count = crate::volume::MAX_VOLUME_MOUNTS + 1;
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("volume.max_volume_count"));
     }
 
     #[test]

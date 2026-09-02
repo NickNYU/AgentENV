@@ -147,6 +147,13 @@ pub struct FirecrackerCommonConfig {
     #[serde(default)]
     pub rootfs_allow_shrink: bool,
     pub extra_drives: Vec<ExtraDrive>,
+    /// Extra drives physically present in the Firecracker snapshot before its
+    /// reserved launch-time volume slots.
+    #[serde(default)]
+    pub physical_extra_drive_count: usize,
+    /// Existing placeholder drives that can be rebound to launch-time volumes.
+    #[serde(default)]
+    pub volume_drive_slots: usize,
     pub ublk_config: Option<UblkConfig>,
     /// Cluster-wide CPU intersection received from the scheduler.
     /// When set, applied via `PUT /cpu-config` before the VM boots.
@@ -194,6 +201,8 @@ impl FirecrackerCommonConfig {
             rootfs_virtual_size: None,
             rootfs_allow_shrink: false,
             extra_drives: Vec::new(),
+            physical_extra_drive_count: 0,
+            volume_drive_slots: 0,
             ublk_config: None,
             cpu_config_json: None,
             network_policy: None,
@@ -507,6 +516,14 @@ impl FirecrackerSnapshotConfig {
         // starts for the first time. When resuming from a snapshot, the full CPU state
         // is already serialised inside vm_state.bin, so re-applying a template would
         // be incorrect and is rejected by Firecracker anyway.
+        let extra_drives = manifest.extra_drives();
+        let physical_extra_drive_count = if manifest.volume_drive_slots == 0 {
+            // Snapshots created before reserved volume slots existed contain
+            // only physical attached drives.
+            extra_drives.len()
+        } else {
+            manifest.physical_extra_drive_count
+        };
         let snapshot_common = FirecrackerCommonConfig {
             ublk_config: Some(overlaybd_ublk_config),
             envd_version: snapshot.committed().runtime_versions.envd_version.clone(),
@@ -515,7 +532,9 @@ impl FirecrackerSnapshotConfig {
             default_user: build_context.user.clone(),
             rootfs_image_config: Some(rootfs_image_config),
             rootfs_virtual_size: Some(manifest.rootfs.virtual_size),
-            extra_drives: manifest.extra_drives(),
+            extra_drives,
+            physical_extra_drive_count,
+            volume_drive_slots: manifest.volume_drive_slots,
             ..base_common
         };
 
@@ -616,13 +635,17 @@ fn validate_overlaybd_extra_drive(
     if !drive_ids.insert(drive_id.to_string()) {
         anyhow::bail!("duplicate extra drive id: {}", drive_id);
     }
-    crate::sandbox::validate_mount_path(drive.mount_path())?;
-    if !mount_paths.insert(drive.mount_path().to_path_buf()) {
+    let mount_path = crate::sandbox::normalize_mount_path(drive.mount_path().to_path_buf())?;
+    if mount_paths
+        .iter()
+        .any(|existing| existing.starts_with(&mount_path) || mount_path.starts_with(existing))
+    {
         anyhow::bail!(
-            "duplicate extra drive mount path: {}",
+            "overlapping extra drive mount path: {}",
             drive.mount_path().display()
         );
     }
+    mount_paths.insert(mount_path);
     if matches!(drive.virtual_size(), Some(0)) {
         anyhow::bail!("extra drive virtual size must be non-zero: {}", drive_id);
     }
@@ -640,7 +663,7 @@ fn validate_overlaybd_extra_drive(
 mod tests {
     use super::*;
     use crate::cfg::{UblkOverlaybdTomlConfig, UblkTomlConfig};
-    use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
+    use crate::snapshot::{CommittedSnapshot, ResolvedAttachedDrive, SnapshotRecord};
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
@@ -774,6 +797,8 @@ mod tests {
                 mount_path: ExtraDrive::default_mount_path("data"),
                 virtual_size: None,
                 sub_path: None,
+                snapshot_output_dir: None,
+                volume: false,
             },
             ExtraDrive::Overlaybd {
                 drive_id: "data".to_string(),
@@ -782,6 +807,8 @@ mod tests {
                 mount_path: ExtraDrive::default_mount_path("data"),
                 virtual_size: None,
                 sub_path: None,
+                snapshot_output_dir: None,
+                volume: false,
             },
         ];
 
@@ -803,7 +830,7 @@ mod tests {
         );
         config.extra_drives = (0..=MAX_EXTRA_DRIVES)
             .map(|i| {
-                let drive_id = format!("data-{i}");
+                let drive_id = format!("data_{i}");
                 ExtraDrive::Overlaybd {
                     mount_path: ExtraDrive::default_mount_path(&drive_id),
                     drive_id,
@@ -814,6 +841,8 @@ mod tests {
                     read_only: true,
                     virtual_size: None,
                     sub_path: None,
+                    snapshot_output_dir: None,
+                    volume: false,
                 }
             })
             .collect();
@@ -891,6 +920,28 @@ mod tests {
         let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
 
         assert_eq!(config.common.tools_drive_version, snapshot_version);
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_runnable_snapshot_treats_manifest_drives_as_physical() -> Result<()> {
+        let drive = ResolvedAttachedDrive::Overlaybd {
+            drive_id: "data".to_owned(),
+            image_config_path: "/tmp/data.json".into(),
+            read_only: true,
+            virtual_size: 4096,
+            mount_path: ExtraDrive::default_mount_path("data"),
+            sub_path: None,
+        };
+        let snapshot = RunnableSnapshot::from_test_legacy_manifest(
+            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
+            vec![drive],
+        );
+
+        let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
+
+        assert_eq!(config.common.physical_extra_drive_count, 1);
+        assert_eq!(config.common.volume_drive_slots, 0);
         Ok(())
     }
 

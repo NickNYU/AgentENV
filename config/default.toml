@@ -192,6 +192,11 @@ poll_ms = 3
 # AgentENV creates a node-local seed under $AENV_HOME/secrets. Configure the
 # same explicit value on every node when cross-node sandbox recovery is required.
 # access_token_hash_seed = "replace-with-a-secret"
+[volume]
+# Maximum persistent volume size in MiB (256 GiB by default).
+max_size_mb = 262144
+# Maximum number of persistent volumes a sandbox may mount.
+max_volume_count = 4
 
 [orchestrator]
 # Expired-sandbox eviction interval in milliseconds (1000 = 1 second).
@@ -341,6 +346,19 @@ concurrency = 4
 # block_size must not exceed 2 GiB; defaults use 256 MiB. Per-image overrides
 # cannot resize it.
 max_inflight_blocks = 16
+
+[template_build]
+# Compress snapshot artifacts captured by template builds, independent of
+# [memory_snapshot].compression_enabled (template builds consult only this
+# section). When enabled, both memory layers and the sealed rootfs read-write
+# layer are compressed. Pause/snapshot captures of running sandboxes are not
+# affected.
+compression_enabled = false
+# Supported algorithms are "lz4" and "zstd".
+compression_algorithm = "lz4"
+# Workers compressing 4 KiB blocks. One is sequential; higher values run in
+# parallel without changing the output layout.
+compression_workers = 1
 
 [observability]
 # Expose node identity, host metrics, and orchestrator runtime metrics.

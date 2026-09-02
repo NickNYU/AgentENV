@@ -1632,11 +1632,20 @@ mod tests {
         let snapshot_manager = Arc::new(mock_snapshot_manager());
         let template_builder = Arc::new(TemplateBuilder::new());
         let image_resolver = Arc::new(ImageResolver::new(&AppConfig::default()));
+        let volume_manager = Arc::new(
+            crate::volume::VolumeManager::open_with_repository(
+                root.path().join("volumes/catalog.json"),
+                snapshot_manager.repository(),
+            )
+            .await
+            .unwrap(),
+        );
         Arc::new(ApiImpl::new(
             orchestrator,
             snapshot_manager,
             template_builder,
             image_resolver,
+            volume_manager,
             None,
             domains,
             ApiKey::new(api_key).unwrap(),
@@ -1735,6 +1744,27 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    async fn control_plane_request(
+        app: &axum::Router,
+        method: Method,
+        uri: impl AsRef<str>,
+        body: impl Into<Body>,
+    ) -> Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri.as_ref())
+                    .header(header::HOST, "localhost")
+                    .header(API_KEY_HEADER, TEST_API_KEY)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(body.into())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     #[test]
@@ -1896,6 +1926,44 @@ mod tests {
             get_status(&app, "/proxy/health", &route).await,
             StatusCode::NOT_FOUND
         );
+    }
+
+    #[tokio::test]
+    async fn volume_child_lifecycle_routes_are_omitted() {
+        let app = server::new(build_api().await);
+        for operation in ["fork", "snapshot", "restore"] {
+            let response = control_plane_request(
+                &app,
+                Method::POST,
+                format!("/volumes/vol_missing/{operation}"),
+                serde_json::to_vec(&json!({"name": "child"})).unwrap(),
+            )
+            .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{operation} route exists"
+            );
+        }
+    }
+
+    #[test]
+    fn e2b_volume_mounts_use_a_path_to_volume_map() {
+        let request: agentenv_http_server::models::NewSandbox = serde_json::from_value(json!({
+            "templateID": "template",
+            "volumeMounts": {"/mnt/data": "vol_123"}
+        }))
+        .expect("E2B volumeMounts map should deserialize");
+        assert_eq!(
+            request.volume_mounts.unwrap().get("/mnt/data"),
+            Some(&"vol_123".to_string())
+        );
+
+        serde_json::from_value::<agentenv_http_server::models::NewSandbox>(json!({
+            "templateID": "template",
+            "volumeMounts": [{"name": "vol_123", "path": "/mnt/data"}]
+        }))
+        .expect_err("array form is not the issue 211 API");
     }
 
     #[tokio::test]

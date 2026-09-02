@@ -10,6 +10,7 @@ use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
+use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
 use clap::Parser;
 use tokio::sync::oneshot;
@@ -86,6 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let identity = NodeIdentity::from_config(&config.node_identity);
     let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
     let p2p_local_endpoint = p2p_transport.local_endpoint();
+    agentenv::image::initialize_image_cache_p2p_transport(Arc::clone(&p2p_transport));
     let overlaybd_p2p =
         OverlaybdP2pRuntime::start_from_app_config(config, Arc::clone(&p2p_transport)).await;
 
@@ -112,8 +114,23 @@ async fn main() -> anyhow::Result<()> {
         &cluster_cpu_arc,
     )));
     let image_resolver = Arc::new(ImageResolver::new(config));
+    let volume_manager = Arc::new(
+        VolumeManager::open_with_repository_and_limits(
+            config.home_path.join("volumes/catalog"),
+            snapshot_manager.repository(),
+            VolumeLimits {
+                max_size_mb: config.volume.max_size_mb,
+                max_mounts: config.volume.max_volume_count,
+            },
+        )
+        .await?,
+    );
     let factory = FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc));
-    let orchestrator = Orchestrator::with_file_backed_store_and_factory(factory).await?;
+    let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(
+        factory,
+        Arc::clone(&volume_manager),
+    )
+    .await?;
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(
@@ -148,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         snapshot_manager,
         template_builder,
         image_resolver,
+        volume_manager,
         observability,
         config.sandbox_proxy.domains.clone(),
         api_key,

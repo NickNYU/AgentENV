@@ -801,6 +801,13 @@ func TestExtractSandboxIDFromResponse(t *testing.T) {
 	if !equalStrings(ids, []string{"sbx-1", "sbx-2"}) {
 		t.Fatalf("expected batch sandbox ids, got %#v", ids)
 	}
+	forkBody := []byte(`[{"sandbox":{"sandboxID":"sbx-child-1"}},{"sandbox":{"sandboxID":"sbx-child-2"}},{"error":{"message":"failed"}}]`)
+	if ids := extractSandboxIDsFromResponse(forkBody); len(ids) != 0 {
+		t.Fatalf("generic response parser should not infer fork ids, got %#v", ids)
+	}
+	if ids := extractForkSandboxIDsFromResponse(forkBody); !equalStrings(ids, []string{"sbx-child-1", "sbx-child-2"}) {
+		t.Fatalf("expected fork child sandbox ids, got %#v", ids)
+	}
 }
 
 func TestUpstreamTargetPath(t *testing.T) {
@@ -1570,7 +1577,7 @@ func TestRecordAssignmentFromResponseUsesHeaderWithoutReadingBody(t *testing.T) 
 	resp.Header.Set(headerSandboxID, "sbx-from-header")
 
 	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
-	if err := server.recordAssignmentFromResponse(context.Background(), resp, node); err != nil {
+	if err := server.recordAssignmentFromResponse(context.Background(), resp, node, "/sandboxes/sbx-from-header"); err != nil {
 		t.Fatalf("recordAssignmentFromResponse returned error: %v", err)
 	}
 

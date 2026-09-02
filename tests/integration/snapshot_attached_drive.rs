@@ -160,7 +160,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
     assert_eq!(setup.exit_code, 0);
 
     let captured = SandboxBackend::snapshot(&mut sandbox).await?;
-    let _ = sandbox.stop().await;
+    sandbox.stop().await?;
 
     let metadata = SnapshotPublishMetadata {
         id: SnapshotId::generate(),
@@ -185,6 +185,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
         },
         virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
         image_configs: agentenv::types::ImageConfigs::new(),
+        volume_snapshots: Vec::new(),
         custom_extension_params: None,
     };
 
