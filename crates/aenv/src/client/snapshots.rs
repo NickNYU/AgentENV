@@ -1,6 +1,7 @@
 use super::{handle_status, Client};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::time::Instant;
 
 #[derive(Debug, Serialize)]
@@ -45,8 +46,10 @@ impl Client {
     /// `deadline`, when set, bounds the whole walk. The client's own timeouts
     /// apply per request, so a paged walk otherwise has no overall bound; here
     /// each page's request is capped by the time left, and a deadline already
-    /// passed stops the walk without issuing another request. `keep_going` is
-    /// called with everything collected so far after each page, and only
+    /// passed stops the walk without issuing another request. A continuation
+    /// token the walk has already used stops it with an error: a server that
+    /// repeats (or cycles) tokens would otherwise page forever. `keep_going`
+    /// is called with everything collected so far after each page, and only
     /// consulted when there is another page to fetch.
     pub fn list_snapshots_while<F>(
         &self,
@@ -60,6 +63,7 @@ impl Client {
         let mut snapshots = Vec::new();
         let mut next_token: Option<String> = None;
         let mut failure = None;
+        let mut used_tokens: HashSet<String> = HashSet::new();
 
         loop {
             // How long the next page may take. A deadline in the past stops
@@ -75,6 +79,17 @@ impl Client {
                 }
                 None => None,
             };
+
+            // Never re-fetch a token the walk has already used: a repeated
+            // (or cycling) continuation token means no progress.
+            if let Some(token) = next_token.as_deref() {
+                if !used_tokens.insert(token.to_string()) {
+                    failure = Some(anyhow!(
+                        "snapshot pagination made no progress: continuation token {token} was already used"
+                    ));
+                    break;
+                }
+            }
 
             let mut request = self.get("/snapshots").query("limit", "100");
             if let Some(sandbox_id) = sandbox_id {
@@ -255,6 +270,40 @@ mod tests {
         let result = client.list_snapshots(None);
         server.join().unwrap();
         assert!(result.is_err());
+    }
+
+    /// A server that keeps handing back a continuation token the walk has
+    /// already used would page forever; the walk must stop and report it
+    /// instead (the stub serves exactly two pages, so a third request would
+    /// hang the test on `accept`).
+    #[test]
+    fn repeated_continuation_token_stops_the_walk() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = Client::new(&format!("http://{address}"), "test-key").unwrap();
+
+        let server = serve(
+            listener,
+            vec![
+                ServedPage {
+                    status: "200 OK",
+                    headers: vec![("x-next-token", "page-2"), ("connection", "close")],
+                    body: r#"[{"snapshotID":"snap-1","names":[]}]"#,
+                },
+                ServedPage {
+                    status: "200 OK",
+                    headers: vec![("x-next-token", "page-2"), ("connection", "close")],
+                    body: r#"[{"snapshotID":"snap-2","names":[]}]"#,
+                },
+            ],
+        );
+
+        let (snapshots, err) = client.list_snapshots_while(None, None, |_| true);
+        server.join().unwrap();
+        assert!(err.is_some(), "the repeated token should be reported");
+        assert_eq!(snapshots.len(), 2, "both fetched pages should survive");
+        assert_eq!(snapshots[0].snapshot_id, "snap-1");
+        assert_eq!(snapshots[1].snapshot_id, "snap-2");
     }
 
     /// A deadline that has already passed stops the walk without another
