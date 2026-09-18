@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::client::sandboxes::ListedSandbox;
 use crate::client::snapshots::SnapshotInfo;
-use crate::client::templates::Template;
+use crate::client::templates::{build_status, Template};
 use crate::client::Client;
 
 const DYNAMIC_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
@@ -21,8 +21,8 @@ const DYNAMIC_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 ///
 /// The timeouts above bound a single HTTP call, but a provider can make several
 /// — templates, then snapshots a page at a time — so their sum is what the user
-/// actually waits for after pressing Tab. Every lookup checks this deadline
-/// before issuing another request, so a slow server costs a bounded pause and
+/// actually waits for after pressing Tab. Each request is capped by the time
+/// left against this deadline, so a slow server costs a bounded pause and
 /// possibly fewer candidates rather than a stalled shell.
 const DYNAMIC_TOTAL_BUDGET: Duration = Duration::from_secs(2);
 
@@ -159,7 +159,10 @@ where
 ///
 /// `buildStatus` is required by the API, so a missing status means a
 /// non-conforming server; such a template is only offered where any status is
-/// accepted, rather than guessed at.
+/// accepted, rather than guessed at. A status the CLI does not know is treated
+/// the way `wait_for_build` treats it — as unfinished — so a status added to
+/// the API later stays watchable instead of silently disappearing from
+/// `template watch`'s candidates.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum TemplateEligibility {
     /// Templates that can be started now: `aenv start`.
@@ -174,8 +177,12 @@ enum TemplateEligibility {
 impl TemplateEligibility {
     fn accepts(self, build_status: Option<&str>) -> bool {
         match self {
-            TemplateEligibility::Ready => build_status == Some("ready"),
-            TemplateEligibility::Pending => matches!(build_status, Some("waiting" | "building")),
+            TemplateEligibility::Ready => build_status == Some(build_status::READY),
+            // Anything but the two terminal outcomes is unfinished, mirroring
+            // `wait_for_build`, which keeps polling on statuses it does not
+            // know rather than treating the build as done.
+            TemplateEligibility::Pending => matches!(build_status, Some(status)
+                if status != build_status::READY && status != build_status::ERROR),
             TemplateEligibility::Any => true,
         }
     }
@@ -226,15 +233,14 @@ where
         // Only a finished build can be started; an unbuilt template would fail.
         set.extend_templates(templates, TemplateEligibility::Ready);
     }
-    // The template lookup may already have spent the whole budget.
-    if Instant::now() < deadline {
-        let snapshots = client.list_snapshots_while(None, |collected| {
-            Instant::now() < deadline && collected.len() < MAX_SNAPSHOT_FETCH
+    // The walk stops at the deadline — each page request is capped by the time
+    // left — and at `MAX_SNAPSHOT_FETCH` snapshots; a page that fails only
+    // costs the pages after it, so what was fetched still becomes candidates.
+    let (snapshots, _failed_page) =
+        client.list_snapshots_while(None, Some(deadline), |collected| {
+            collected.len() < MAX_SNAPSHOT_FETCH
         });
-        if let Ok(snapshots) = snapshots {
-            set.extend_snapshots(snapshots);
-        }
-    }
+    set.extend_snapshots(snapshots);
     set.into_vec()
 }
 
@@ -736,6 +742,16 @@ mod tests {
                 "`template watch` should not offer a {status} template"
             );
         }
+    }
+
+    /// `wait_for_build` keeps polling on statuses it does not know rather than
+    /// treating the build as finished, so an API-added state (say a queued
+    /// phase) must stay watchable instead of silently disappearing from
+    /// completion.
+    #[test]
+    fn watch_accepts_statuses_the_watcher_would_keep_polling() {
+        assert!(TemplateEligibility::Pending.accepts(Some("queued")));
+        assert!(TemplateEligibility::Pending.accepts(Some("initializing")));
     }
 
     #[test]

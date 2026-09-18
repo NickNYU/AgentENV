@@ -90,7 +90,7 @@ filtered to the build statuses each command can act on:
 
 ```bash
 aenv start <TAB>                 # ready templates and snapshots: names, then IDs
-aenv template watch <TAB>        # templates still waiting or building
+aenv template watch <TAB>        # templates whose build has not finished
 aenv template delete <TAB>       # every template, whatever its build did
 ```
 

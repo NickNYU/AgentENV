@@ -1,4 +1,7 @@
-use crate::client::{templates::Template, Client};
+use crate::client::{
+    templates::{build_status, Template},
+    Client,
+};
 use crate::output::{self, Format};
 use anyhow::{bail, Result};
 use clap::{Args as ClapArgs, Subcommand};
@@ -121,14 +124,14 @@ pub(crate) fn wait_for_build(
         }
 
         match info.status.as_str() {
-            "ready" => {
+            build_status::READY => {
                 finish_status_line(
                     &format!("Build succeeded: template {template_id} is ready."),
                     last_line_len,
                 )?;
                 return Ok(());
             }
-            "error" => {
+            build_status::ERROR => {
                 let reason = info
                     .reason
                     .map(format_build_failure_reason)
@@ -136,7 +139,7 @@ pub(crate) fn wait_for_build(
                 clear_status_line(last_line_len)?;
                 bail!("Build failed: {reason}");
             }
-            "waiting" | "building" => {}
+            build_status::WAITING | build_status::BUILDING => {}
             other => {
                 if status_changed {
                     finish_status_line(
