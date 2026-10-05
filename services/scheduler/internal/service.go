@@ -163,10 +163,15 @@ func (s *Service) filterFreshObservations(rich []RichNode) []RichNode {
 	if !ok {
 		return rich
 	}
+	// Compare at millisecond precision: LastReportAt is reconstructed from a
+	// millisecond timestamp while the acquisition time has nanoseconds, so a
+	// report in the same millisecond as the acquisition must count as fresh
+	// (#341 review).
+	sinceMs := since.UnixMilli()
 	fresh := make([]RichNode, 0, len(rich))
 	for _, n := range rich {
 		at, reported := s.nodes.LastReportAt(n.Node.ID)
-		if reported && !at.Before(since) {
+		if reported && at.UnixMilli() >= sinceMs {
 			fresh = append(fresh, n)
 			continue
 		}
@@ -282,6 +287,17 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 	return s.ingestNodeReport(nodeReportFromProto(req), s.now())
 }
 
+// ingestNodeError maps registry ingest failures to gRPC statuses.
+func ingestNodeError(logger *zap.Logger, nodeID string, err error) error {
+	if errors.Is(err, ErrNodeNotInRegistry) {
+		logger.Warn("scheduler rejected observed registration for unknown node",
+			zap.String("node_id", nodeID),
+		)
+		return status.Error(codes.InvalidArgument, "node is not in scheduler node list")
+	}
+	return status.Error(codes.Internal, "node registry heartbeat failed")
+}
+
 // nodeReportFromProto adapts a Heartbeat RPC request to the neutral ingest
 // currency. Identity validation already happened in Heartbeat.
 func nodeReportFromProto(req *schedulerv1.HeartbeatRequest) *nodeReport {
@@ -309,15 +325,26 @@ func nodeReportFromProto(req *schedulerv1.HeartbeatRequest) *nodeReport {
 // node snapshots (sync-node-snapshots on leadership acquisition, #259):
 // update registry observations, then reconcile sandbox bindings.
 func (s *Service) ingestNodeReport(report *nodeReport, now time.Time) (*schedulerv1.HeartbeatResponse, error) {
-	node, cpuConfigJSON, err := s.nodes.Heartbeat(report.toHeartbeatRequest(), now)
-	if err != nil {
-		if errors.Is(err, ErrNodeNotInRegistry) {
-			s.logger.Warn("scheduler rejected observed registration for unknown node",
-				zap.String("node_id", report.nodeID),
-			)
-			return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
+	req := report.toHeartbeatRequest()
+	var node Node
+	var cpuConfigJSON string
+	if !report.fetchedAt.IsZero() {
+		// Pulled report: apply only if nothing newer landed meanwhile; the
+		// check is atomic with the write inside the registry (#341 review).
+		applied, n, cpu, err := s.nodes.HeartbeatUnlessStale(req, now, report.fetchedAt)
+		if err != nil {
+			return nil, ingestNodeError(s.logger, report.nodeID, err)
 		}
-		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
+		if !applied {
+			return &schedulerv1.HeartbeatResponse{}, nil
+		}
+		node, cpuConfigJSON = n, cpu
+	} else {
+		n, cpu, err := s.nodes.Heartbeat(req, now)
+		if err != nil {
+			return nil, ingestNodeError(s.logger, report.nodeID, err)
+		}
+		node, cpuConfigJSON = n, cpu
 	}
 	// Reconcile only from an authoritative roster (heartbeat). A snapshot
 	// pull leaves sandboxIDs nil — bindings are refreshed by heartbeats and

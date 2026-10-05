@@ -126,32 +126,42 @@ func TestAdminSnapshotFetcherHeartbeatIngestCompatibility(t *testing.T) {
 	}
 }
 
-// Freshness guard (#341 review, N1): a pull captured before a heartbeat
-// must not overwrite it; a pull captured after is applied; heartbeat-shaped
-// reports are never skipped.
-func TestSkipStalePull(t *testing.T) {
-	_, registry, _ := newTestService(t, []string{"node-a"})
+// Freshness guard (#341 review): the registry applies a pulled report
+// atomically only when nothing newer exists — a pull captured before a
+// heartbeat must not overwrite it, a pull captured after is applied, and
+// heartbeat-shaped reports are never skipped.
+func TestPulledIngestIsAtomicWithNewerReports(t *testing.T) {
+	svc, registry, _ := newTestService(t, []string{"node-a"})
 	t0 := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
 
 	// A heartbeat lands at t0+1s.
 	if _, _, err := registry.Heartbeat(heartbeatFor("node-a", "inst-1"), t0.Add(time.Second)); err != nil {
 		t.Fatalf("heartbeat failed: %v", err)
 	}
+	before, _ := registry.LastReportAt("node-a")
 
-	stale := &nodeReport{nodeID: "node-a", fetchedAt: t0}
-	if !skipStalePull(registry, stale) {
-		t.Fatal("a pull captured before the latest heartbeat must be skipped")
+	// A pull captured before that heartbeat must not overwrite it.
+	stale := &nodeReport{nodeID: "node-a", serviceInstanceID: "inst-1", fetchedAt: t0}
+	if _, err := svc.ingestNodeReport(stale, t0.Add(2*time.Second)); err != nil {
+		t.Fatalf("stale pull ingest failed: %v", err)
 	}
-	fresh := &nodeReport{nodeID: "node-a", fetchedAt: t0.Add(2 * time.Second)}
-	if skipStalePull(registry, fresh) {
-		t.Fatal("a pull captured after the latest heartbeat must be applied")
+	after, _ := registry.LastReportAt("node-a")
+	if !after.Equal(before) {
+		t.Fatalf("stale pull must not overwrite the newer heartbeat: before=%v after=%v", before, after)
 	}
-	heartbeatShaped := &nodeReport{nodeID: "node-a"}
-	if skipStalePull(registry, heartbeatShaped) {
-		t.Fatal("heartbeat-shaped reports (zero fetchedAt) must never be skipped")
+
+	// A pull captured after the heartbeat is applied.
+	fresh := &nodeReport{nodeID: "node-a", serviceInstanceID: "inst-1", fetchedAt: t0.Add(3 * time.Second)}
+	if _, err := svc.ingestNodeReport(fresh, t0.Add(3*time.Second)); err != nil {
+		t.Fatalf("fresh pull ingest failed: %v", err)
 	}
-	unknown := &nodeReport{nodeID: "node-b", fetchedAt: t0}
-	if skipStalePull(registry, unknown) {
-		t.Fatal("an unobserved node must not be skipped")
+	after2, _ := registry.LastReportAt("node-a")
+	if !after2.After(after) {
+		t.Fatalf("fresh pull must be applied: after=%v after2=%v", after, after2)
+	}
+
+	// Heartbeat-shaped reports (zero fetchedAt) always apply.
+	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-1"), t0.Add(4*time.Second)); err != nil {
+		t.Fatalf("heartbeat-shaped ingest failed: %v", err)
 	}
 }

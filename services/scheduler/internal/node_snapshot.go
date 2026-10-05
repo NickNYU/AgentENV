@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -90,18 +91,6 @@ type NodeSnapshotFetcher func(ctx context.Context, node Node) (*nodeReport, erro
 // shared ingest path. The retriever never holds the Service itself.
 type nodeReportIngester func(report *nodeReport, now time.Time) error
 
-// skipStalePull reports whether a pulled report should be dropped because
-// the node has already reported something newer — a heartbeat that arrived
-// while the pull was in flight (#341 review). Heartbeat-shaped reports
-// (zero fetchedAt) are never skipped.
-func skipStalePull(registry NodeRegistry, report *nodeReport) bool {
-	if report.fetchedAt.IsZero() {
-		return false
-	}
-	at, ok := registry.LastReportAt(report.nodeID)
-	return ok && at.After(report.fetchedAt)
-}
-
 type ConcurrentNodeSnapshotRefresher struct {
 	logger      *zap.Logger
 	ingest      nodeReportIngester
@@ -167,6 +156,7 @@ type adminNodeResponse struct {
 	CreateFails        uint64 `json:"createFails"`
 	SandboxStartingCnt uint32 `json:"sandboxStartingCount"`
 	SandboxPausedCount uint32 `json:"sandboxPausedCount"`
+	Status             string `json:"status"`
 	MachineInfo        struct {
 		CPUFamily       string `json:"cpuFamily"`
 		CPUModel        string `json:"cpuModel"`
@@ -193,6 +183,24 @@ type adminNodeResponse struct {
 	} `json:"metrics"`
 }
 
+// adminStatusToProto maps the admin /nodes status string to the proto
+// NodeStatus. Unknown values stay UNSPECIFIED (the registry then derives
+// CONNECTING, same as a first heartbeat).
+func adminStatusToProto(status string) schedulerv1.NodeStatus {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "ready":
+		return schedulerv1.NodeStatus_NODE_STATUS_READY
+	case "connecting":
+		return schedulerv1.NodeStatus_NODE_STATUS_CONNECTING
+	case "unhealthy":
+		return schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY
+	case "lingering":
+		return schedulerv1.NodeStatus_NODE_STATUS_LINGERING
+	default:
+		return schedulerv1.NodeStatus_NODE_STATUS_UNSPECIFIED
+	}
+}
+
 // NewAdminSnapshotFetcher builds the production NodeSnapshotFetcher (#259,
 // sync-node-snapshots): it pulls GET {endpoint}/nodes for observations and
 // returns the fetched data as a nodeReport for the shared ingest path.
@@ -204,6 +212,10 @@ func NewAdminSnapshotFetcher(apiKey string) NodeSnapshotFetcher {
 	client := &http.Client{Timeout: 5 * time.Second}
 	return func(ctx context.Context, node Node) (*nodeReport, error) {
 		base := strings.TrimRight(node.Endpoint, "/")
+		// Stamp the capture time before the request: a heartbeat landing
+		// while this request is in flight must count as newer than whatever
+		// the response contains (#341 review).
+		fetchedAt := time.Now()
 
 		var nodes []adminNodeResponse
 		if err := adminGetJSON(ctx, client, apiKey, base+"/nodes", &nodes); err != nil {
@@ -216,9 +228,9 @@ func NewAdminSnapshotFetcher(apiKey string) NodeSnapshotFetcher {
 				break
 			}
 		}
-		if entry == nil && len(nodes) == 1 {
-			entry = &nodes[0]
-		}
+		// Never accept a response for a different node ID: a stale or
+		// misconfigured endpoint must not overwrite another node's
+		// observation (#341 review).
 		if entry == nil {
 			return nil, fmt.Errorf("pull %s /nodes: node not in admin response", node.ID)
 		}
@@ -226,7 +238,7 @@ func NewAdminSnapshotFetcher(apiKey string) NodeSnapshotFetcher {
 		// Only /nodes is pulled: observations, not the sandbox roster. See
 		// nodeReport.sandboxIDs for why the roster is never reconciled from
 		// a pull.
-		return reportFromAdmin(entry), nil
+		return reportFromAdmin(entry, fetchedAt), nil
 	}
 }
 
@@ -246,10 +258,13 @@ func adminGetJSON(ctx context.Context, client *http.Client, apiKey, url string, 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status %s", resp.Status)
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	// Bound the decoded body: pulls fan out across nodes during acquisition,
+	// and a faulty or compromised node must not make the leader allocate
+	// from an arbitrarily large response (#341 review).
+	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
 }
 
-func reportFromAdmin(n *adminNodeResponse) *nodeReport {
+func reportFromAdmin(n *adminNodeResponse, fetchedAt time.Time) *nodeReport {
 	disks := make([]*schedulerv1.DiskMetric, 0, len(n.Metrics.Disks))
 	for _, d := range n.Metrics.Disks {
 		disks = append(disks, &schedulerv1.DiskMetric{
@@ -266,7 +281,7 @@ func reportFromAdmin(n *adminNodeResponse) *nodeReport {
 		serviceInstanceID: n.ServiceInstanceID,
 		version:           n.Version,
 		commit:            n.Commit,
-		fetchedAt:         time.Now(),
+		fetchedAt:         fetchedAt,
 		machineInfo: &schedulerv1.MachineInfo{
 			CpuFamily:       n.MachineInfo.CPUFamily,
 			CpuModel:        n.MachineInfo.CPUModel,
@@ -275,6 +290,7 @@ func reportFromAdmin(n *adminNodeResponse) *nodeReport {
 			CpuConfigJson:   n.MachineInfo.CPUConfigJSON,
 		},
 		snapshot: &schedulerv1.NodeSnapshot{
+			Status:                     adminStatusToProto(n.Status),
 			AllocatedCpu:               n.Metrics.AllocatedCPU,
 			AllocatedMemoryBytes:       n.Metrics.AllocatedMemoryBytes,
 			CpuPercent:                 n.Metrics.CPUPercent,

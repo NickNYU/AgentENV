@@ -142,7 +142,10 @@ func (l *leadershipSnapshot) RecoveryPending(nodeID string, lastReportAt time.Ti
 	if !l.leader || !l.knownNodes[nodeID] {
 		return false
 	}
-	return !ok || lastReportAt.Before(l.since)
+	// Millisecond-precision comparison, matching the scheduler's freshness
+	// rule (#341 review): a report in the same millisecond as the
+	// acquisition counts as post-acquisition.
+	return !ok || lastReportAt.UnixMilli() < l.since.UnixMilli()
 }
 
 // InRecoveryWindow reports whether the recovery window following leadership
@@ -395,11 +398,9 @@ func (l *leadershipManager) onStartedLeading(ctx context.Context) {
 		return
 	}
 	ingestor := func(report *nodeReport, now time.Time) error {
-		// Freshness guard (#341 review): a slow pull must not overwrite a
-		// heartbeat that arrived while the request was in flight.
-		if skipStalePull(l.registry, report) {
-			return nil
-		}
+		// Freshness is enforced atomically inside the registry by
+		// HeartbeatUnlessStale (#341 review): a slow pull cannot overwrite a
+		// heartbeat that landed while the request was in flight.
 		_, err := l.svc.ingestNodeReport(report, now)
 		return err
 	}

@@ -31,6 +31,9 @@ type NodeRegistry interface {
 	// never reported. Used by the leader-election recovery window to tell
 	// fresh observations from pre-acquisition ones (#259).
 	LastReportAt(nodeID string) (time.Time, bool)
+	// HeartbeatUnlessStale applies a report only when the node has no newer
+	// report than notOlderThan, atomically (#341 review).
+	HeartbeatUnlessStale(req *schedulerv1.HeartbeatRequest, now, notOlderThan time.Time) (applied bool, node Node, cpuConfigJSON string, err error)
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -143,6 +146,29 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 }
 
 func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error) {
+	node, cpu, err := r.heartbeat(req, now, time.Time{})
+	return node, cpu, err
+}
+
+// HeartbeatUnlessStale applies a report only when the node has no newer
+// report than notOlderThan. The check and the write hold the same lock, so
+// a heartbeat landing between a pull's freshness check and its ingest
+// cannot be overwritten by that pull (#341 review). applied is false when
+// a newer report already exists; node and cpuConfigJSON are zero then.
+func (r *AtomicNodeRegistry) HeartbeatUnlessStale(req *schedulerv1.HeartbeatRequest, now, notOlderThan time.Time) (applied bool, node Node, cpuConfigJSON string, err error) {
+	node, cpu, err := r.heartbeat(req, now, notOlderThan)
+	if err != nil {
+		if errors.Is(err, errStaleReport) {
+			return false, Node{}, "", nil
+		}
+		return false, Node{}, "", err
+	}
+	return true, node, cpu, nil
+}
+
+var errStaleReport = errors.New("a newer report already exists")
+
+func (r *AtomicNodeRegistry) heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time, notOlderThan time.Time) (Node, string, error) {
 	nowMs := now.UTC().UnixMilli()
 
 	machineInfo := cloneMachineInfo(req.GetMachineInfo())
@@ -153,14 +179,27 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	if !ok {
 		return Node{}, "", ErrNodeNotInRegistry
 	}
+	if !notOlderThan.IsZero() {
+		if prev, ok := r.observed[req.GetNodeId()]; ok && prev.node.GetLastSeenUnixMs() > notOlderThan.UTC().UnixMilli() {
+			return Node{}, "", errStaleReport
+		}
+	}
 
 	prevCPU, existed := "", false
+	prevP2P := (*schedulerv1.P2PEndpoint)(nil)
 	if prev, ok := r.observed[req.GetNodeId()]; ok {
 		existed = true
 		prevCPU = prev.node.GetMachineInfo().GetCpuConfigJson()
+		prevP2P = prev.p2pEndpoint
 		if machineInfo != nil && machineInfo.CpuConfigJson == "" {
 			machineInfo.CpuConfigJson = prevCPU
 		}
+	}
+	// A report without a P2P endpoint (e.g. a snapshot pull, which the admin
+	// API does not serve) must not erase a previously known one (#341 review).
+	p2pEndpoint := cloneP2PEndpoint(req.GetP2PEndpoint())
+	if p2pEndpoint == nil {
+		p2pEndpoint = prevP2P
 	}
 
 	record := observedNodeRecord{
@@ -175,7 +214,7 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 			LastSeenUnixMs:    nowMs,
 			Snapshot:          cloneSnapshot(req.GetSnapshot()),
 		},
-		p2pEndpoint: cloneP2PEndpoint(req.GetP2PEndpoint()),
+		p2pEndpoint: p2pEndpoint,
 		reportTTL:   r.observedTTL,
 	}
 	if record.node.Snapshot.GetReportedAtUnixMs() == 0 {
