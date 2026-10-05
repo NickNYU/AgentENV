@@ -30,12 +30,17 @@ patches:
       - op: replace
         path: /spec/replicas
         value: 3
+      # Standbys are Ready (overall health) so they are in Service endpoints
+      # and can serve reads from the shared Redis bindings. Writes that land
+      # on a standby are rejected by the leader gate and retried onto the
+      # leader by the gateway's round_robin + retry policy. The leader health
+      # service (scheduler.v1.Scheduler/leader) stays registered for
+      # observability but does not gate endpoints in this topology.
       - op: replace
         path: /spec/template/spec/containers/0/readinessProbe/exec/command
         value:
           - /grpc_health_probe
           - -addr=127.0.0.1:9090
-          - -service=scheduler.v1.Scheduler/leader
       # sync-node-snapshots pulls authenticate against node admin APIs with
       # the cluster-wide admin key; mount it from the shared agentenv-auth
       # Secret, never from a ConfigMap.

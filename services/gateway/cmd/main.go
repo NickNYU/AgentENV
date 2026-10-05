@@ -32,10 +32,29 @@ const (
 	maxAPIKeyFileLen  = maxAPIKeyLen + 2
 )
 
+// schedulerServiceConfig enables round_robin load balancing across scheduler
+// replicas and retries Unavailable once or twice, so write RPCs that land on
+// a leader-gated standby (Unavailable "not the leader") are retried onto the
+// leader (#341, HA topology with standbys in Service endpoints).
+const schedulerServiceConfig = `{
+  "loadBalancingConfig": [{"round_robin": {}}],
+  "methodConfig": [{
+    "name": [{"service": "scheduler.v1.Scheduler"}],
+    "retryPolicy": {
+      "maxAttempts": 3,
+      "initialBackoff": "0.2s",
+      "maxBackoff": "1s",
+      "backoffMultiplier": 2,
+      "retryableStatusCodes": ["UNAVAILABLE"]
+    }
+  }]
+}`
+
 func newSchedulerConn(addr string) (*grpc.ClientConn, error) {
 	return grpc.NewClient(
 		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultServiceConfig(schedulerServiceConfig),
 	)
 }
 
