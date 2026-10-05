@@ -149,18 +149,28 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 }
 
 // filterFreshObservations applies the fresh-observations-only rule (#259):
-// while the recovery window is open, only nodes observed at or after the
-// leadership acquisition are scheduling candidates. Outside the window (or
-// with leader election disabled) all nodes pass, preserving today's
-// fail-open behaviour for new nodes.
+// a node that was known at leadership acquisition is a scheduling candidate
+// only once it has reported at or after the acquisition — a timer alone
+// must not readmit a node whose reporter is still backing off (#341
+// review). Nodes that joined after the acquisition are not in the
+// recovery-pending set and keep the steady-state fail-open behaviour; with
+// leader election disabled everything passes.
 func (s *Service) filterFreshObservations(rich []RichNode) []RichNode {
-	if !s.inRecoveryWindow() {
+	if s.leadership == nil {
 		return rich
 	}
-	since, _ := s.leadership.LeaderSince()
+	since, ok := s.leadership.LeaderSince()
+	if !ok {
+		return rich
+	}
 	fresh := make([]RichNode, 0, len(rich))
 	for _, n := range rich {
-		if at, ok := s.nodes.LastReportAt(n.Node.ID); ok && !at.Before(since) {
+		at, reported := s.nodes.LastReportAt(n.Node.ID)
+		if reported && !at.Before(since) {
+			fresh = append(fresh, n)
+			continue
+		}
+		if !s.leadership.RecoveryPending(n.Node.ID, at, reported) {
 			fresh = append(fresh, n)
 		}
 	}

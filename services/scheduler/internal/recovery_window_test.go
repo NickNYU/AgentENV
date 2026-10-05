@@ -59,7 +59,7 @@ func newLeaderTestService(t *testing.T, nodeIDs []string, recoveryTTL time.Durat
 	store := NewInMemoryBindingStore(30 * time.Second)
 	clock := &fixedClock{now: at}
 	svc := NewService(nil, registry, NewStrategy("round_robin"), store,
-		WithLeadership(acquiredLeadershipSnapshot(recoveryTTL, acquireAt)),
+		WithLeadership(acquiredLeadershipSnapshot(recoveryTTL, acquireAt, nodeIDs...)),
 		WithClock(clock.Now),
 	)
 	return svc, registry, clock
@@ -248,5 +248,48 @@ func TestPullIngestPreservesBindingsWithoutRoster(t *testing.T) {
 	node, ok, err := store.Get("sbx-paused", time.Now())
 	if err != nil || !ok || node.ID != "node-a" {
 		t.Fatalf("pull without a roster must preserve bindings: ok=%v node=%v err=%v", ok, node, err)
+	}
+}
+
+// Case: #341 review (Copilot, service.go) — a node known at acquisition
+// whose pull failed and whose reporter is still backing off must stay
+// excluded after the recovery TTL expires; a node that joined after the
+// acquisition keeps the steady-state fail-open admission.
+func TestKnownUnobservedNodeStaysExcludedPastRecoveryTTL(t *testing.T) {
+	t0 := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	svc, registry, clock := newLeaderTestService(t, []string{"node-old"}, 30*time.Second, t0.Add(2*time.Second), t0)
+
+	// node-old was known at acquisition but never reports (pull failed,
+	// reporter backing off up to 60s). node-new is registered later, so it
+	// is not in the acquisition-time recovery-pending set.
+	registry.Set([]Node{
+		{ID: "node-old", Endpoint: "http://node-old:8080"},
+		{ID: "node-new", Endpoint: "http://node-new:8080"},
+	}, nil)
+
+	// Well past the recovery TTL: the timer alone must not readmit node-old.
+	clock.now = t0.Add(90 * time.Second)
+	resp, err := svc.Schedule(context.Background(), &schedulerv1.ScheduleRequest{})
+	if err != nil {
+		t.Fatalf("schedule failed: %v", err)
+	}
+	if got := resp.GetNode().GetNodeId(); got != "node-new" {
+		t.Fatalf("past the TTL, node-old must still be excluded; got %q", got)
+	}
+
+	// Once node-old finally reports, it becomes a candidate again.
+	if _, err := svc.Heartbeat(context.Background(), heartbeatFor("node-old", "inst-o")); err != nil {
+		t.Fatalf("late heartbeat failed: %v", err)
+	}
+	seen := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		resp, err := svc.Schedule(context.Background(), &schedulerv1.ScheduleRequest{})
+		if err != nil {
+			t.Fatalf("schedule %d failed: %v", i, err)
+		}
+		seen[resp.GetNode().GetNodeId()] = true
+	}
+	if !seen["node-old"] {
+		t.Fatalf("after its late report, node-old must be schedulable; seen %v", seen)
 	}
 }

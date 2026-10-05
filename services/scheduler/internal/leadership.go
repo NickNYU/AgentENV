@@ -30,6 +30,9 @@ import (
 type leadershipView interface {
 	InRecoveryWindow(now time.Time) bool
 	LeaderSince() (time.Time, bool)
+	// RecoveryPending reports whether nodeID was known at acquisition and
+	// has not yet produced a post-acquisition report.
+	RecoveryPending(nodeID string, lastReportAt time.Time, ok bool) bool
 }
 
 // Leadership is the single external contract for the scheduler's
@@ -74,12 +77,13 @@ func NewLeadership(logger *zap.Logger, cfg config.SchedulerConfig) Leadership {
 // a single-writer scheduler without any conditional wiring.
 type nonLeadership struct{}
 
-func (nonLeadership) InRecoveryWindow(time.Time) bool    { return false }
-func (nonLeadership) LeaderSince() (time.Time, bool)     { return time.Time{}, false }
-func (nonLeadership) ServiceOption() ServiceOption       { return func(*Service) {} }
-func (nonLeadership) RegisterHealth(*health.Server)      {}
-func (nonLeadership) BindRuntime(*Service, NodeRegistry) {}
-func (nonLeadership) MarkNotServing()                    {}
+func (nonLeadership) InRecoveryWindow(time.Time) bool              { return false }
+func (nonLeadership) LeaderSince() (time.Time, bool)               { return time.Time{}, false }
+func (nonLeadership) RecoveryPending(string, time.Time, bool) bool { return false }
+func (nonLeadership) ServiceOption() ServiceOption                 { return func(*Service) {} }
+func (nonLeadership) RegisterHealth(*health.Server)                {}
+func (nonLeadership) BindRuntime(*Service, NodeRegistry)           {}
+func (nonLeadership) MarkNotServing()                              {}
 func (nonLeadership) GateInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		return handler(ctx, req)
@@ -105,6 +109,12 @@ type leadershipSnapshot struct {
 	leader      bool
 	since       time.Time
 	recoveryTTL time.Duration
+	// knownNodes is the node set known at acquisition. A known node with no
+	// post-acquisition report stays excluded from scheduling until it
+	// reports — a timer alone must not readmit it while its reporter is
+	// still backing off (#341 review). Nodes that join later are not in the
+	// set and keep the steady-state fail-open behavior.
+	knownNodes map[string]bool
 }
 
 // newLeadership is the not-leading state. recoveryTTL bounds the recovery
@@ -115,9 +125,24 @@ func newLeadershipSnapshot(recoveryTTL time.Duration) *leadershipSnapshot {
 	return &leadershipSnapshot{recoveryTTL: recoveryTTL}
 }
 
-// acquiredLeadership is the leading state, acquired at now.
-func acquiredLeadershipSnapshot(recoveryTTL time.Duration, now time.Time) *leadershipSnapshot {
-	return &leadershipSnapshot{leader: true, since: now, recoveryTTL: recoveryTTL}
+// acquiredLeadershipSnapshot is the leading state, acquired at now, with the
+// node set known at that moment (the recovery-pending set).
+func acquiredLeadershipSnapshot(recoveryTTL time.Duration, now time.Time, knownNodes ...string) *leadershipSnapshot {
+	known := make(map[string]bool, len(knownNodes))
+	for _, id := range knownNodes {
+		known[id] = true
+	}
+	return &leadershipSnapshot{leader: true, since: now, recoveryTTL: recoveryTTL, knownNodes: known}
+}
+
+// recoveryPending reports whether nodeID was known at acquisition and has
+// not yet produced a post-acquisition report (lastReportAt is the node's
+// latest report time, ok=false when it never reported).
+func (l *leadershipSnapshot) RecoveryPending(nodeID string, lastReportAt time.Time, ok bool) bool {
+	if !l.leader || !l.knownNodes[nodeID] {
+		return false
+	}
+	return !ok || lastReportAt.Before(l.since)
 }
 
 // InRecoveryWindow reports whether the recovery window following leadership
@@ -215,6 +240,11 @@ func (l *leadershipManager) InRecoveryWindow(now time.Time) bool {
 // LeaderSince delegates to the internal leadership state.
 func (l *leadershipManager) LeaderSince() (time.Time, bool) {
 	return l.state.Load().LeaderSince()
+}
+
+// RecoveryPending delegates to the internal leadership state.
+func (l *leadershipManager) RecoveryPending(nodeID string, lastReportAt time.Time, ok bool) bool {
+	return l.state.Load().RecoveryPending(nodeID, lastReportAt, ok)
 }
 
 // standbyReadableMethods classifies every Scheduler RPC: true = a non-leader
@@ -347,7 +377,16 @@ func (l *leadershipManager) Run(ctx context.Context, onStop func()) error {
 // bindings by pulling every node's admin snapshot instead of waiting for the
 // next reporter backoff (#259).
 func (l *leadershipManager) onStartedLeading(ctx context.Context) {
-	l.state.Store(acquiredLeadershipSnapshot(l.cfg.ReportTTL, time.Now()))
+	// Capture the acquisition-time node set for recovery-pending semantics;
+	// tolerate being called before BindRuntime (tests, construction-order
+	// guard).
+	known := make([]string, 0)
+	if l.registry != nil {
+		for _, n := range l.registry.Snapshot(false) {
+			known = append(known, n.ID)
+		}
+	}
+	l.state.Store(acquiredLeadershipSnapshot(l.cfg.ReportTTL, time.Now(), known...))
 	if l.health != nil {
 		l.health.SetServingStatus(LeaderHealthService, grpc_health_v1.HealthCheckResponse_SERVING)
 	}
