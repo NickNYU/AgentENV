@@ -42,19 +42,33 @@ func main() {
 	}
 	defer logger.Sync()
 
-	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// rootCancel lets a leadership loss drive the same graceful shutdown as a
+	// signal: the ex-leader exits and restarts as a standby (fencing, #259).
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+	sigCtx, stop := signal.NotifyContext(rootCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	store, closeStore := createBindingStore(logger, cfg)
 	defer closeStore()
 
-	g := grpc.NewServer(grpc.UnaryInterceptor(scheduler.MetricsUnaryInterceptor()))
+	// Leadership facade (#259): the factory picks the election manager (election
+	// on) or a no-op (election off); all wiring below is unconditional.
+	leadership := scheduler.NewLeadership(logger, cfg.Scheduler)
+
+	interceptors := []grpc.UnaryServerInterceptor{
+		scheduler.MetricsUnaryInterceptor(),
+		leadership.GateInterceptor(),
+	}
+	g := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptors...))
+	var registry *scheduler.AtomicNodeRegistry
+	var svc *scheduler.Service
 	if *queryOnly {
-		svc := scheduler.NewQueryOnlyService(logger, store)
-		schedulerv1.RegisterSchedulerServer(g, svc)
+		qo := scheduler.NewQueryOnlyService(logger, store)
+		schedulerv1.RegisterSchedulerServer(g, qo)
 		logger.Info("scheduler query-only service enabled", zap.String("redis_addr", cfg.Scheduler.RedisAddr))
 	} else {
-		registry := scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
+		registry = scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
 		switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
 		case "kubernetes":
 			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry)
@@ -66,16 +80,20 @@ func main() {
 			registry.Set(nodes, nil)
 		}
 
-		svc := scheduler.NewService(
-			logger,
-			registry,
-			scheduler.NewStrategy(cfg.Scheduler.Strategy),
-			store,
+		svcOpts := []scheduler.ServiceOption{
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,
 				cfg.Scheduler.ArtifactLookupNodeLimit,
 			)),
 			scheduler.WithNodeResourceLimit(cfg.Scheduler.NodeResourceLimit),
+		}
+		svcOpts = append(svcOpts, leadership.ServiceOption())
+		svc = scheduler.NewService(
+			logger,
+			registry,
+			scheduler.NewStrategy(cfg.Scheduler.Strategy),
+			store,
+			svcOpts...,
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		schedulerv1.RegisterSchedulerServer(g, svc)
@@ -84,7 +102,15 @@ func main() {
 	hs := health.NewServer()
 	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+	leadership.RegisterHealth(hs)
 	grpc_health_v1.RegisterHealthServer(g, hs)
+
+	leadership.BindRuntime(svc, registry)
+	go func() {
+		if err := leadership.Run(sigCtx, rootCancel); err != nil {
+			logger.Fatal("leader election failed", zap.Error(err))
+		}
+	}()
 
 	lis, err := net.Listen("tcp", cfg.Scheduler.GRPCListenAddr)
 	if err != nil {
@@ -130,6 +156,7 @@ func main() {
 	logger.Info("scheduler shutdown signal received")
 	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
 	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	leadership.MarkNotServing()
 
 	gracefulStopDone := make(chan struct{})
 	go func() {
@@ -160,12 +187,36 @@ func main() {
 	}
 }
 
+// effectiveBindingTTL floors the binding TTL under leader election (#259,
+// failover safeguard): bindings must outlive the worst-case failover budget
+// (lease detection + endpoints propagation + one reporter reconnect backoff),
+// or live sandboxes would be misreported as NotFound mid-failover. The
+// authoritative cleanup is ReconcileNode; the TTL only guards against a node
+// that crashed for good, so raising it is harmless.
+func effectiveBindingTTL(cfg config.Config) time.Duration {
+	ttl := cfg.Scheduler.BindingTTL
+	if cfg.Scheduler.LeaderElection.Enabled {
+		floor := cfg.Scheduler.LeaderElection.LeaseDuration + 90*time.Second
+		if floor > ttl {
+			ttl = floor
+		}
+	}
+	return ttl
+}
+
 func createBindingStore(logger *zap.Logger, cfg config.Config) (scheduler.BindingStore, func()) {
+	ttl := effectiveBindingTTL(cfg)
+	if ttl != cfg.Scheduler.BindingTTL {
+		logger.Info("binding TTL raised to cover the failover budget",
+			zap.Duration("configured", cfg.Scheduler.BindingTTL),
+			zap.Duration("effective", ttl),
+		)
+	}
 	if strings.TrimSpace(cfg.Scheduler.RedisAddr) == "" {
-		return scheduler.NewInMemoryBindingStore(cfg.Scheduler.BindingTTL), func() {}
+		return scheduler.NewInMemoryBindingStore(ttl), func() {}
 	}
 
-	store, err := scheduler.NewRedisBindingStore(cfg.Scheduler.RedisAddr, cfg.Scheduler.BindingTTL)
+	store, err := scheduler.NewRedisBindingStore(cfg.Scheduler.RedisAddr, ttl)
 	if err != nil {
 		logger.Fatal("create redis binding store failed", zap.Error(err), zap.String("addr", cfg.Scheduler.RedisAddr))
 	}
