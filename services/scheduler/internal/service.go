@@ -275,6 +275,13 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 // nodeReportFromProto adapts a Heartbeat RPC request to the neutral ingest
 // currency. Identity validation already happened in Heartbeat.
 func nodeReportFromProto(req *schedulerv1.HeartbeatRequest) *nodeReport {
+	// A heartbeat roster is always authoritative, including when empty:
+	// proto3 decodes absent and empty repeated fields identically, so force
+	// a non-nil slice to keep heartbeats reconciling (see nodeReport).
+	sandboxIDs := req.GetSandboxIds()
+	if sandboxIDs == nil {
+		sandboxIDs = []string{}
+	}
 	return &nodeReport{
 		nodeID:            req.GetNodeId(),
 		clusterID:         req.GetClusterId(),
@@ -283,7 +290,7 @@ func nodeReportFromProto(req *schedulerv1.HeartbeatRequest) *nodeReport {
 		commit:            req.GetCommit(),
 		machineInfo:       req.GetMachineInfo(),
 		snapshot:          req.GetSnapshot(),
-		sandboxIDs:        req.GetSandboxIds(),
+		sandboxIDs:        sandboxIDs,
 		p2pEndpoint:       req.GetP2PEndpoint(),
 	}
 }
@@ -302,12 +309,17 @@ func (s *Service) ingestNodeReport(report *nodeReport, now time.Time) (*schedule
 		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
-	if err := s.store.ReconcileNode(node, report.sandboxIDs, now); err != nil {
-		s.logger.Warn("scheduler heartbeat binding reconcile failed",
-			zap.String("node_id", report.nodeID),
-			zap.Error(err),
-		)
-		return nil, status.Error(codes.Unavailable, "binding store unavailable")
+	// Reconcile only from an authoritative roster (heartbeat). A snapshot
+	// pull leaves sandboxIDs nil — bindings are refreshed by heartbeats and
+	// guarded meanwhile by the binding TTL floor (#341 review).
+	if report.sandboxIDs != nil {
+		if err := s.store.ReconcileNode(node, report.sandboxIDs, now); err != nil {
+			s.logger.Warn("scheduler heartbeat binding reconcile failed",
+				zap.String("node_id", report.nodeID),
+				zap.Error(err),
+			)
+			return nil, status.Error(codes.Unavailable, "binding store unavailable")
+		}
 	}
 	return &schedulerv1.HeartbeatResponse{CpuConfigJson: cpuConfigJSON}, nil
 }

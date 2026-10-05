@@ -175,6 +175,9 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 			s.LeaderElection.LeaseNamespace = *le.LeaseNamespace
 		}
 		if le.SnapshotPullConcurrency != nil {
+			if *le.SnapshotPullConcurrency <= 0 {
+				return fmt.Errorf("scheduler.leader_election.snapshot_pull_concurrency must be greater than zero, got %d", *le.SnapshotPullConcurrency)
+			}
 			s.LeaderElection.SnapshotPullConcurrency = *le.SnapshotPullConcurrency
 		}
 		durationFields := []struct {
@@ -193,6 +196,11 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 			d, err := parseSchedulerDuration(f.raw, f.field)
 			if err != nil {
 				return err
+			}
+			// Defaults apply to omitted fields only; an explicitly provided
+			// non-positive duration is invalid, not a request for the default.
+			if d <= 0 {
+				return fmt.Errorf("%s must be greater than zero, got %q", f.field, d.String())
 			}
 			*f.dst = d
 		}

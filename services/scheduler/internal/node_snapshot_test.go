@@ -88,9 +88,10 @@ func TestAdminSnapshotFetcherAssemblesHeartbeatShape(t *testing.T) {
 	if len(snap.GetDisks()) != 1 || snap.GetDisks()[0].GetDevice() != "/dev/ublkb0" {
 		t.Fatalf("disk mapping wrong: %+v", snap.GetDisks())
 	}
-	ids := req.sandboxIDs
-	if len(ids) != 2 || ids[0] != "sbx-1" || ids[1] != "sbx-2" {
-		t.Fatalf("sandbox ids wrong: %v", ids)
+	// A pull must not carry a sandbox roster: reconciling from it would
+	// delete live bindings (paused sandboxes, template builds) on failover.
+	if req.sandboxIDs != nil {
+		t.Fatalf("pull must leave sandboxIDs nil, got %v", req.sandboxIDs)
 	}
 }
 
@@ -118,7 +119,9 @@ func TestAdminSnapshotFetcherHeartbeatIngestCompatibility(t *testing.T) {
 	if registry.PeekObserved("node-a") == nil {
 		t.Fatal("pulled snapshot must record an observation")
 	}
-	if _, ok, err := store.Get("sbx-1", time.Now()); err != nil || !ok {
-		t.Fatalf("pulled snapshot must reconcile bindings: ok=%v err=%v", ok, err)
+	// The pull refreshes observations only; bindings are refreshed by
+	// heartbeats, so nothing may be written to the store here.
+	if _, ok, err := store.Get("sbx-1", time.Now()); err != nil || ok {
+		t.Fatalf("pull-ingest must not touch bindings: ok=%v err=%v", ok, err)
 	}
 }

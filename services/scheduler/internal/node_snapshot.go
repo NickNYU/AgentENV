@@ -38,8 +38,17 @@ type nodeReport struct {
 	commit            string
 	machineInfo       *schedulerv1.MachineInfo
 	snapshot          *schedulerv1.NodeSnapshot
-	sandboxIDs        []string
-	p2pEndpoint       *schedulerv1.P2PEndpoint
+	// sandboxIDs carries the node's authoritative sandbox roster. Three
+	// states matter:
+	//   non-nil (including empty) — authoritative (heartbeat): reconcile
+	//     bindings to exactly this set;
+	//   nil — unknown (snapshot pull): bindings are left untouched. A pull
+	//     cannot see paused sandboxes or in-flight template builds, so
+	//     reconciling from it would delete live bindings on failover
+	//     (#341 review). Binding refresh stays with heartbeats, and the
+	//     binding TTL floor covers the gap.
+	sandboxIDs  []string
+	p2pEndpoint *schedulerv1.P2PEndpoint
 }
 
 // toHeartbeatRequest converts the report to the registry's proto shape; the
@@ -166,16 +175,10 @@ type adminNodeResponse struct {
 	} `json:"metrics"`
 }
 
-// adminSandboxEntry mirrors a ListedSandbox entry from GET /sandboxes; only
-// the id is needed for binding reconciliation.
-type adminSandboxEntry struct {
-	SandboxID string `json:"sandboxID"`
-}
-
 // NewAdminSnapshotFetcher builds the production NodeSnapshotFetcher (#259,
 // sync-node-snapshots): it pulls GET {endpoint}/nodes for observations and
-// GET {endpoint}/sandboxes for the sandbox id list, and returns the fetched
-// data as a nodeReport for the shared ingest path.
+// returns the fetched data as a nodeReport for the shared ingest path.
+// Bindings are deliberately not pulled (see nodeReport.sandboxIDs).
 // The node's admin API requires the x-api-key header. The HTTP client is an
 // implementation detail with a bounded per-request timeout; tests inject
 // through the NodeSnapshotFetcher seam, not this constructor.
@@ -202,12 +205,10 @@ func NewAdminSnapshotFetcher(apiKey string) NodeSnapshotFetcher {
 			return nil, fmt.Errorf("pull %s /nodes: node not in admin response", node.ID)
 		}
 
-		var sandboxes []adminSandboxEntry
-		if err := adminGetJSON(ctx, client, apiKey, base+"/sandboxes", &sandboxes); err != nil {
-			return nil, fmt.Errorf("pull %s /sandboxes: %w", node.ID, err)
-		}
-
-		return reportFromAdmin(entry, sandboxes), nil
+		// Only /nodes is pulled: observations, not the sandbox roster. See
+		// nodeReport.sandboxIDs for why the roster is never reconciled from
+		// a pull.
+		return reportFromAdmin(entry), nil
 	}
 }
 
@@ -230,13 +231,7 @@ func adminGetJSON(ctx context.Context, client *http.Client, apiKey, url string, 
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
-func reportFromAdmin(n *adminNodeResponse, sandboxes []adminSandboxEntry) *nodeReport {
-	ids := make([]string, 0, len(sandboxes))
-	for _, s := range sandboxes {
-		if strings.TrimSpace(s.SandboxID) != "" {
-			ids = append(ids, s.SandboxID)
-		}
-	}
+func reportFromAdmin(n *adminNodeResponse) *nodeReport {
 	disks := make([]*schedulerv1.DiskMetric, 0, len(n.Metrics.Disks))
 	for _, d := range n.Metrics.Disks {
 		disks = append(disks, &schedulerv1.DiskMetric{
@@ -277,6 +272,5 @@ func reportFromAdmin(n *adminNodeResponse, sandboxes []adminSandboxEntry) *nodeR
 			PausedAllocatedCpu:         n.Metrics.PausedAllocatedCPU,
 			PausedAllocatedMemoryBytes: n.Metrics.PausedAllocatedMemoryBytes,
 		},
-		sandboxIDs: ids,
 	}
 }

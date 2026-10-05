@@ -224,3 +224,29 @@ func TestLookupNodeWindowSemantics(t *testing.T) {
 		t.Fatalf("window closed: GetNode want NotFound, got %v", err)
 	}
 }
+
+// Case F4 regression (#341 review): a snapshot pull carries no roster, so
+// pulling must never delete existing bindings — including bindings for
+// paused sandboxes that no list endpoint would report.
+func TestPullIngestPreservesBindingsWithoutRoster(t *testing.T) {
+	svc, registry, store := newTestService(t, []string{"node-a"})
+
+	// A binding exists, e.g. for a paused sandbox.
+	if err := store.Record("sbx-paused", Node{ID: "node-a", Endpoint: "http://node-a:8080"}, time.Now()); err != nil {
+		t.Fatalf("seed binding failed: %v", err)
+	}
+
+	// A pull-shaped report: observations present, roster unknown (nil).
+	pulled := &nodeReport{nodeID: "node-a", serviceInstanceID: "inst-a"}
+	if _, err := svc.ingestNodeReport(pulled, time.Now()); err != nil {
+		t.Fatalf("pull ingest failed: %v", err)
+	}
+
+	if registry.PeekObserved("node-a") == nil {
+		t.Fatal("pull must still record the observation")
+	}
+	node, ok, err := store.Get("sbx-paused", time.Now())
+	if err != nil || !ok || node.ID != "node-a" {
+		t.Fatalf("pull without a roster must preserve bindings: ok=%v node=%v err=%v", ok, node, err)
+	}
+}

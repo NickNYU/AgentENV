@@ -190,9 +190,11 @@ func TestGateStandbyWithStoreServesReads(t *testing.T) {
 		t.Fatalf("standby with a shared store must serve LookupNode: called=%v err=%v", called, err)
 	}
 
+	// GetNode reads replica-local observations, which are always empty on a
+	// standby — it stays gated even with a shared store (#341 review, F2).
 	called, err = invokeGate(t, false, true, "/scheduler.v1.Scheduler/GetNode")
-	if !called || err != nil {
-		t.Fatalf("standby with a shared store must serve GetNode: called=%v err=%v", called, err)
+	if called || status.Code(err) != codes.Unavailable {
+		t.Fatalf("GetNode must stay gated on standbys (observations are leader-local): called=%v err=%v", called, err)
 	}
 
 	called, err = invokeGate(t, false, true, "/scheduler.v1.Scheduler/RecordAssignment")

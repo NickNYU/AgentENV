@@ -225,9 +225,9 @@ func (l *leadershipManager) LeaderSince() (time.Time, bool) {
 //
 // Notes on the reads:
 //   - LookupNode reads bindings from the shared store: correct on standbys.
-//   - GetNode reads replica-local observations, which are empty on standbys
-//     until heartbeats/pulls arrive; classified readable per the design
-//     matrix anyway (a miss degrades to NotFound, not to wrong data).
+//   - GetNode reads replica-local observations, which are always empty on
+//     standbys (heartbeats/pulls only reach the leader), so serving it there
+//     would return a terminal NotFound for real nodes. Gated (#341 review).
 //   - ListNodes reads the informer-backed registry (warm on every replica)
 //     and is semantically standby-serveable, but stays gated for now —
 //     deferred to a PR decision (#259 review).
@@ -243,7 +243,7 @@ var standbyReadableMethods = map[string]bool{
 	"/scheduler.v1.Scheduler/RecordP2pArtifact":  false,
 	"/scheduler.v1.Scheduler/ForgetP2pArtifact":  false,
 	"/scheduler.v1.Scheduler/LookupP2pArtifact":  false,
-	"/scheduler.v1.Scheduler/GetNode":            true,
+	"/scheduler.v1.Scheduler/GetNode":            false,
 	"/scheduler.v1.Scheduler/UnregisterNode":     false,
 }
 
@@ -442,8 +442,11 @@ func (r *leaderElector) Run(ctx context.Context) error {
 				r.logger.Info("scheduler leader changed", zap.String("leader", identity))
 			},
 		},
-		// Release the lease on graceful shutdown so failover is fast.
-		ReleaseOnCancel: true,
+		// Hold the lease until process exit: releasing on cancel would let
+		// a standby acquire while this ex-leader is still draining in-flight
+		// RPCs, opening a dual-primary window (#341 review). Failover after a
+		// graceful stop is bounded by the remaining lease duration.
+		ReleaseOnCancel: false,
 	})
 	if err != nil {
 		return fmt.Errorf("leader election config: %w", err)
