@@ -125,3 +125,33 @@ func TestAdminSnapshotFetcherHeartbeatIngestCompatibility(t *testing.T) {
 		t.Fatalf("pull-ingest must not touch bindings: ok=%v err=%v", ok, err)
 	}
 }
+
+// Freshness guard (#341 review, N1): a pull captured before a heartbeat
+// must not overwrite it; a pull captured after is applied; heartbeat-shaped
+// reports are never skipped.
+func TestSkipStalePull(t *testing.T) {
+	_, registry, _ := newTestService(t, []string{"node-a"})
+	t0 := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+
+	// A heartbeat lands at t0+1s.
+	if _, _, err := registry.Heartbeat(heartbeatFor("node-a", "inst-1"), t0.Add(time.Second)); err != nil {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+
+	stale := &nodeReport{nodeID: "node-a", fetchedAt: t0}
+	if !skipStalePull(registry, stale) {
+		t.Fatal("a pull captured before the latest heartbeat must be skipped")
+	}
+	fresh := &nodeReport{nodeID: "node-a", fetchedAt: t0.Add(2 * time.Second)}
+	if skipStalePull(registry, fresh) {
+		t.Fatal("a pull captured after the latest heartbeat must be applied")
+	}
+	heartbeatShaped := &nodeReport{nodeID: "node-a"}
+	if skipStalePull(registry, heartbeatShaped) {
+		t.Fatal("heartbeat-shaped reports (zero fetchedAt) must never be skipped")
+	}
+	unknown := &nodeReport{nodeID: "node-b", fetchedAt: t0}
+	if skipStalePull(registry, unknown) {
+		t.Fatal("an unobserved node must not be skipped")
+	}
+}

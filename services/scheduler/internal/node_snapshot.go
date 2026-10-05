@@ -49,6 +49,12 @@ type nodeReport struct {
 	//     binding TTL floor covers the gap.
 	sandboxIDs  []string
 	p2pEndpoint *schedulerv1.P2PEndpoint
+	// fetchedAt records when a pulled report's data was captured. A report
+	// built from a heartbeat leaves it zero (always fresh). The ingest guard
+	// uses it to keep a slow pull from overwriting a newer heartbeat
+	// (#341 review): skip the pull when the node has already reported
+	// something captured after this data.
+	fetchedAt time.Time
 }
 
 // toHeartbeatRequest converts the report to the registry's proto shape; the
@@ -83,6 +89,18 @@ type NodeSnapshotFetcher func(ctx context.Context, node Node) (*nodeReport, erro
 // nodeReportIngester is the retriever's only dependency on the Service: the
 // shared ingest path. The retriever never holds the Service itself.
 type nodeReportIngester func(report *nodeReport, now time.Time) error
+
+// skipStalePull reports whether a pulled report should be dropped because
+// the node has already reported something newer — a heartbeat that arrived
+// while the pull was in flight (#341 review). Heartbeat-shaped reports
+// (zero fetchedAt) are never skipped.
+func skipStalePull(registry NodeRegistry, report *nodeReport) bool {
+	if report.fetchedAt.IsZero() {
+		return false
+	}
+	at, ok := registry.LastReportAt(report.nodeID)
+	return ok && at.After(report.fetchedAt)
+}
 
 type ConcurrentNodeSnapshotRefresher struct {
 	logger      *zap.Logger
@@ -248,6 +266,7 @@ func reportFromAdmin(n *adminNodeResponse) *nodeReport {
 		serviceInstanceID: n.ServiceInstanceID,
 		version:           n.Version,
 		commit:            n.Commit,
+		fetchedAt:         time.Now(),
 		machineInfo: &schedulerv1.MachineInfo{
 			CpuFamily:       n.MachineInfo.CPUFamily,
 			CpuModel:        n.MachineInfo.CPUModel,

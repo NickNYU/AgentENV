@@ -356,6 +356,11 @@ func (l *leadershipManager) onStartedLeading(ctx context.Context) {
 		return
 	}
 	ingestor := func(report *nodeReport, now time.Time) error {
+		// Freshness guard (#341 review): a slow pull must not overwrite a
+		// heartbeat that arrived while the request was in flight.
+		if skipStalePull(l.registry, report) {
+			return nil
+		}
 		_, err := l.svc.ingestNodeReport(report, now)
 		return err
 	}
