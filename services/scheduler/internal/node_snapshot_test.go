@@ -126,11 +126,11 @@ func TestAdminSnapshotFetcherHeartbeatIngestCompatibility(t *testing.T) {
 	}
 }
 
-// Freshness guard (#341 review): the registry applies a pulled report
-// atomically only when nothing newer exists — a pull captured before a
-// heartbeat must not overwrite it, a pull captured after is applied, and
-// heartbeat-shaped reports are never skipped.
-func TestPulledIngestIsAtomicWithNewerReports(t *testing.T) {
+// Freshness guard (#341 review): the pull path skips reports older than
+// the node's latest observation — a pull captured before a heartbeat must
+// not overwrite it, a pull captured after is applied, and heartbeat-shaped
+// reports are never skipped.
+func TestPulledIngestSkipsStaleReports(t *testing.T) {
 	svc, registry, _ := newTestService(t, []string{"node-a"})
 	t0 := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
 

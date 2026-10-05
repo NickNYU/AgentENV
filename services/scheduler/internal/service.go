@@ -175,7 +175,11 @@ func (s *Service) filterFreshObservations(rich []RichNode) []RichNode {
 			fresh = append(fresh, n)
 			continue
 		}
-		if !s.leadership.RecoveryPending(n.Node.ID, at, reported) {
+		var lastReport *time.Time
+		if reported {
+			lastReport = &at
+		}
+		if !s.leadership.RecoveryPending(n.Node.ID, lastReport) {
 			fresh = append(fresh, n)
 		}
 	}
@@ -326,25 +330,22 @@ func nodeReportFromProto(req *schedulerv1.HeartbeatRequest) *nodeReport {
 // update registry observations, then reconcile sandbox bindings.
 func (s *Service) ingestNodeReport(report *nodeReport, now time.Time) (*schedulerv1.HeartbeatResponse, error) {
 	req := report.toHeartbeatRequest()
-	var node Node
-	var cpuConfigJSON string
 	if !report.fetchedAt.IsZero() {
-		// Pulled report: apply only if nothing newer landed meanwhile; the
-		// check is atomic with the write inside the registry (#341 review).
-		applied, n, cpu, err := s.nodes.HeartbeatUnlessStale(req, now, report.fetchedAt)
-		if err != nil {
-			return nil, ingestNodeError(s.logger, report.nodeID, err)
-		}
-		if !applied {
+		// Pulled report: skip when the node already reported something
+		// newer (#341 review). The residual check-then-act window is
+		// microseconds and self-heals on the next heartbeat.
+		if at, ok := s.nodes.LastReportAt(report.nodeID); ok && at.After(report.fetchedAt) {
 			return &schedulerv1.HeartbeatResponse{}, nil
 		}
-		node, cpuConfigJSON = n, cpu
-	} else {
-		n, cpu, err := s.nodes.Heartbeat(req, now)
-		if err != nil {
-			return nil, ingestNodeError(s.logger, report.nodeID, err)
+		// The admin API does not serve the P2P endpoint; carry over the
+		// previously known one so a pull does not erase it (#341 review).
+		if req.P2PEndpoint == nil {
+			req.P2PEndpoint = s.nodes.P2PEndpointFor(report.nodeID)
 		}
-		node, cpuConfigJSON = n, cpu
+	}
+	node, cpuConfigJSON, err := s.nodes.Heartbeat(req, now)
+	if err != nil {
+		return nil, ingestNodeError(s.logger, report.nodeID, err)
 	}
 	// Reconcile only from an authoritative roster (heartbeat). A snapshot
 	// pull leaves sandboxIDs nil — bindings are refreshed by heartbeats and
