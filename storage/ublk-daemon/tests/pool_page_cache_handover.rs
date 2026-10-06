@@ -20,7 +20,7 @@
 //!   4. reacquire the same image (same dev_id) and compare buffered vs
 //!      `O_DIRECT` reads at the marker offset;
 //!   5. as a control, verify `BLKFLSBUF` after the switch restores the
-//!      buffered path.
+//!      buffered path, then clean up before the final regression assertion.
 //!
 //! Requires Linux with ublk (`make test-ublk` supplies CAP_SYS_ADMIN through
 //! scripts/run-with-capabilities.sh). Ignored by default: the final buffered
@@ -30,7 +30,7 @@
 use std::alloc::{alloc, dealloc, Layout};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,7 +58,7 @@ const BLKFLSBUF: u32 = 0x1261;
 /// Build a sealed LSMT lower of `virtual_size` bytes whose only content is a
 /// known nonzero page at `MARKER_OFFSET`, plus the read-only image config
 /// (file lower, empty `repoBlobUrl`, no upper) referencing it.
-async fn create_marker_image(dir: &Path) -> Result<std::path::PathBuf> {
+async fn create_marker_image(dir: &Path) -> Result<PathBuf> {
     let lower_data = dir.join("lower.data");
     let lower_index = dir.join("lower.index");
     let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&lower_data)?);
@@ -89,11 +89,14 @@ async fn create_marker_image(dir: &Path) -> Result<std::path::PathBuf> {
 }
 
 /// Write the daemon's overlaybd global config with `cache_dir` as the file
-/// cache, returning its path.
-fn write_global_config(dir: &Path) -> Result<std::path::PathBuf> {
+/// cache, returning its path. `cache_type` must be set explicitly: when it is
+/// empty, config normalization falls back to the legacy `registry_cache_dir`
+/// (`/opt/overlaybd/registry_cache`) and the isolated directory is lost.
+fn write_global_config(dir: &Path) -> Result<PathBuf> {
     let cache_dir = dir.join("cache");
     std::fs::create_dir_all(&cache_dir).context("create cache dir")?;
     let mut global = GlobalConfig::default();
+    global.cache_config.cache_type = "file".to_string();
     global.cache_config.cache_dir = cache_dir.to_string_lossy().into_owned();
     let path = dir.join("global.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&global)?).context("write global config")?;
@@ -115,7 +118,7 @@ async fn acquire(
     socket_path: &Path,
     image_config: &Path,
     global_config: &Path,
-) -> Result<(u32, std::path::PathBuf)> {
+) -> Result<(u32, PathBuf)> {
     let response = rpc(
         socket_path,
         &DaemonRequest::AcquireOverlaybd {
@@ -143,6 +146,18 @@ async fn release(socket_path: &Path, dev_id: u32) -> Result<()> {
     }
 }
 
+/// Run blocking device I/O off the async runtime workers so a stalled read or
+/// ioctl cannot delay the in-process daemon sharing this runtime.
+async fn blocking<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .context("join blocking device I/O")?
+}
+
 /// Read `PAGE` bytes at `MARKER_OFFSET` with `O_DIRECT`, bypassing the page
 /// cache. Buffer alignment is required by `O_DIRECT`.
 fn read_direct(device_path: &Path) -> Result<Vec<u8>> {
@@ -154,16 +169,40 @@ fn read_direct(device_path: &Path) -> Result<Vec<u8>> {
     let layout = Layout::from_size_align(PAGE, PAGE).expect("page layout");
     let raw = unsafe { alloc(layout) };
     anyhow::ensure!(!raw.is_null(), "aligned page allocation failed");
-    let buf = unsafe { std::slice::from_raw_parts_mut(raw, PAGE) };
-    let read = file
-        .read_at(buf, MARKER_OFFSET)
-        .context("O_DIRECT read at marker offset");
-    let result = read.map(|n| {
-        assert_eq!(n, PAGE, "short O_DIRECT read");
-        buf.to_vec()
-    });
+    // The closure returns `Err` instead of panicking on short reads, and
+    // `dealloc` runs unconditionally afterward, so the aligned page cannot
+    // leak and I/O failures keep their context.
+    let result = (|| -> Result<Vec<u8>> {
+        let buf = unsafe { std::slice::from_raw_parts_mut(raw, PAGE) };
+        let n = file
+            .read_at(buf, MARKER_OFFSET)
+            .context("O_DIRECT read at marker offset")?;
+        anyhow::ensure!(n == PAGE, "short O_DIRECT read: {n} bytes");
+        Ok(buf.to_vec())
+    })();
     unsafe { dealloc(raw, layout) };
     result
+}
+
+/// Read the marker page through a buffered FD, requiring a full page: a short
+/// read must fail loudly instead of passing with a partially zeroed buffer.
+fn read_buffered_page(file: &std::fs::File) -> Result<Vec<u8>> {
+    let mut buf = vec![0u8; PAGE];
+    let n = file
+        .read_at(&mut buf, MARKER_OFFSET)
+        .context("buffered read at marker offset")?;
+    anyhow::ensure!(n == PAGE, "short buffered read: {n} bytes");
+    Ok(buf)
+}
+
+/// Read the marker page through the retained FD on a blocking thread,
+/// returning FD ownership for the next operation.
+async fn read_retained(fd: std::fs::File) -> Result<(std::fs::File, Vec<u8>)> {
+    blocking(move || {
+        let page = read_buffered_page(&fd)?;
+        Ok((fd, page))
+    })
+    .await
 }
 
 /// Best-effort BLKFLSBUF, mirroring the daemon's `clear_page_cache`.
@@ -184,6 +223,46 @@ fn flush_buffer_cache(device_path: &Path) -> Result<()> {
 
 fn first_u64le(page: &[u8]) -> u64 {
     u64::from_le_bytes(page[..8].try_into().expect("page prefix"))
+}
+
+/// Synchronous best-effort RPC for the cleanup guard: `Drop` may run during
+/// unwinding on a runtime thread, where async I/O is unavailable.
+fn sync_rpc(socket_path: &Path, request: &DaemonRequest) -> Result<()> {
+    use std::io::{Read, Write};
+    let mut stream =
+        std::os::unix::net::UnixStream::connect(socket_path).context("connect daemon socket")?;
+    let payload = serde_json::to_vec(request).context("serialize request")?;
+    stream.write_all(&(payload.len() as u32).to_be_bytes())?;
+    stream.write_all(&payload)?;
+    let mut len = [0u8; 4];
+    stream.read_exact(&mut len)?;
+    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    stream.read_exact(&mut body)?;
+    Ok(())
+}
+
+/// Best-effort cleanup on every exit path: release the pooled device and shut
+/// the daemon down so a failed (or intentionally failing) run never leaks a
+/// live ublk device or a running server task into later tests or the host.
+struct DaemonCleanup {
+    socket_path: PathBuf,
+    dev_id: Option<u32>,
+    server_task: Option<tokio::task::JoinHandle<Result<()>>>,
+}
+
+impl Drop for DaemonCleanup {
+    fn drop(&mut self) {
+        if let Some(dev_id) = self.dev_id.take() {
+            let _ = sync_rpc(
+                &self.socket_path,
+                &DaemonRequest::ReleaseOverlaybd { dev_id },
+            );
+        }
+        let _ = sync_rpc(&self.socket_path, &DaemonRequest::Shutdown);
+        if let Some(task) = self.server_task.take() {
+            task.abort();
+        }
+    }
 }
 
 // Multi-thread runtime like the daemon binary: device setup performs blocking
@@ -228,44 +307,48 @@ async fn pooled_device_must_not_serve_stale_placeholder_pages() -> Result<()> {
     );
 
     let server = Arc::new(server);
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
-    let mut server_task = {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut cleanup = {
         let server = Arc::clone(&server);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             server
                 .run_with_ready_signal(|| {
-                    ready_tx.send(()).expect("notify ready");
-                    Ok(())
+                    ready_tx
+                        .send(())
+                        .map_err(|_| anyhow::anyhow!("ready receiver dropped"))
                 })
                 .await
-        })
-    };
-    // Surface an early server failure instead of only reporting a timeout.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        match ready_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(()) => break,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                if server_task.is_finished() {
-                    (&mut server_task)
-                        .await
-                        .context("join failed daemon task")?
-                        .context("daemon exited before becoming ready")?;
-                }
-                anyhow::ensure!(
-                    std::time::Instant::now() < deadline,
-                    "daemon did not become ready"
-                );
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                anyhow::bail!("daemon exited before signaling readiness");
-            }
+        });
+        DaemonCleanup {
+            socket_path: socket_path.clone(),
+            dev_id: None,
+            server_task: Some(task),
         }
-    }
+    };
+
+    // Wait asynchronously for readiness and surface an early daemon exit
+    // instead of only reporting a timeout.
+    let server_task = cleanup.server_task.as_mut().expect("server task");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::select! {
+            joined = server_task => {
+                joined
+                    .context("join daemon task")?
+                    .context("daemon exited before becoming ready")
+            }
+            ready = ready_rx => ready.context("daemon exited before signaling readiness"),
+        }
+    })
+    .await
+    .context("daemon did not become ready")??;
 
     // Step 1: acquire and record the marker page through O_DIRECT.
     let (dev_id, device_path) = acquire(&socket_path, &image_config, &global_config).await?;
-    let original = read_direct(&device_path)?;
+    cleanup.dev_id = Some(dev_id);
+    let original = {
+        let path = device_path.clone();
+        blocking(move || read_direct(&path)).await?
+    };
     assert_eq!(
         first_u64le(&original),
         MARKER_OFFSET,
@@ -279,23 +362,34 @@ async fn pooled_device_must_not_serve_stale_placeholder_pages() -> Result<()> {
     // whose cache lifetime spans the handover. Verify the placeholder reads
     // as zeros, discard any business-image read-ahead, then deliberately fill
     // the placeholder page cache.
-    let retained = std::fs::OpenOptions::new()
-        .read(true)
-        .open(&device_path)
-        .context("open retained buffered fd")?;
-    let mut buffered = vec![0u8; PAGE];
-    retained.read_at(&mut buffered, MARKER_OFFSET)?;
-
+    let mut retained_fd = {
+        let path = device_path.clone();
+        blocking(move || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .context("open retained buffered fd")
+        })
+        .await?
+    };
+    let idle_direct = {
+        let path = device_path.clone();
+        blocking(move || read_direct(&path)).await?
+    };
     assert_eq!(
-        read_direct(&device_path)?,
+        idle_direct,
         vec![0u8; PAGE],
         "idle placeholder must read as zeros via O_DIRECT"
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
-    flush_buffer_cache(&device_path)?;
-    retained.read_at(&mut buffered, MARKER_OFFSET)?;
+    {
+        let path = device_path.clone();
+        blocking(move || flush_buffer_cache(&path)).await?;
+    }
+    let (fd, idle_buffered) = read_retained(retained_fd).await?;
+    retained_fd = fd;
     assert_eq!(
-        buffered,
+        idle_buffered,
         vec![0u8; PAGE],
         "idle placeholder must read as zeros via the buffered path"
     );
@@ -304,40 +398,55 @@ async fn pooled_device_must_not_serve_stale_placeholder_pages() -> Result<()> {
     let (dev_id2, device_path2) = acquire(&socket_path, &image_config, &global_config).await?;
     assert_eq!(dev_id, dev_id2, "pool must reuse the same device");
     assert_eq!(device_path, device_path2);
+    cleanup.dev_id = Some(dev_id2);
 
-    // Direct reads must see the business image again (control).
+    // Control: direct reads must see the business image again.
+    let direct_after = {
+        let path = device_path.clone();
+        blocking(move || read_direct(&path)).await?
+    };
     assert_eq!(
-        read_direct(&device_path)?,
-        original,
+        direct_after, original,
         "post-switch O_DIRECT read must return the marker page"
     );
 
-    // The regression assertion: buffered reads must not serve pages cached
-    // while the device was bound to the placeholder.
-    retained.read_at(&mut buffered, MARKER_OFFSET)?;
-    assert_eq!(
-        first_u64le(&buffered),
-        MARKER_OFFSET,
-        "post-switch buffered read served a stale placeholder page (issue #302)"
-    );
-    assert_eq!(buffered, original);
+    // The stale buffered page is captured, not yet asserted: the recovery
+    // control and cleanup below must run even when the defect reproduces.
+    let (fd, stale_buffered) = read_retained(retained_fd).await?;
+    retained_fd = fd;
 
     // Control: invalidating the device cache after the switch restores the
     // buffered path.
-    flush_buffer_cache(&device_path)?;
-    retained.read_at(&mut buffered, MARKER_OFFSET)?;
+    {
+        let path = device_path.clone();
+        blocking(move || flush_buffer_cache(&path)).await?;
+    }
+    let (fd, recovered) = read_retained(retained_fd).await?;
+    retained_fd = fd;
     assert_eq!(
-        buffered, original,
+        recovered, original,
         "buffered read after BLKFLSBUF must return the marker page"
     );
 
-    // Cleanup.
-    drop(retained);
+    // Cleanup before the regression assertion: close the retained FD, release
+    // the device, and shut the daemon down gracefully.
+    drop(retained_fd);
     release(&socket_path, dev_id2).await?;
+    cleanup.dev_id = None;
     rpc(&socket_path, &DaemonRequest::Shutdown).await?;
-    server_task
-        .await
-        .context("join daemon task")?
-        .context("daemon run failed")?;
+    if let Some(task) = cleanup.server_task.take() {
+        task.await
+            .context("join daemon task")?
+            .context("daemon run failed")?;
+    }
+
+    // The regression assertion, intentionally last: buffered reads must not
+    // serve pages cached while the device was bound to the placeholder.
+    assert_eq!(
+        first_u64le(&stale_buffered),
+        MARKER_OFFSET,
+        "post-switch buffered read served a stale placeholder page (issue #302)"
+    );
+    assert_eq!(stale_buffered, original);
     Ok(())
 }
