@@ -27,7 +27,7 @@
 //! assertion fails until the image-switch handover invalidates stale cache
 //! pages; un-ignore together with the fix for issue #302.
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{dealloc, Layout};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
