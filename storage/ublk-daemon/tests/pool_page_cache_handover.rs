@@ -167,7 +167,7 @@ fn read_direct(device_path: &Path) -> Result<Vec<u8>> {
         .open(device_path)
         .context("open device for O_DIRECT read")?;
     let layout = Layout::from_size_align(PAGE, PAGE).expect("page layout");
-    let raw = unsafe { alloc(layout) };
+    let raw = unsafe { std::alloc::alloc_zeroed(layout) };
     anyhow::ensure!(!raw.is_null(), "aligned page allocation failed");
     // The closure returns `Err` instead of panicking on short reads, and
     // `dealloc` runs unconditionally afterward, so the aligned page cannot
