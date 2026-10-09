@@ -88,10 +88,70 @@ func TestAdminSnapshotFetcherAssemblesHeartbeatShape(t *testing.T) {
 	if len(snap.GetDisks()) != 1 || snap.GetDisks()[0].GetDevice() != "/dev/ublkb0" {
 		t.Fatalf("disk mapping wrong: %+v", snap.GetDisks())
 	}
-	// A pull must not carry a sandbox roster: reconciling from it would
-	// delete live bindings (paused sandboxes, template builds) on failover.
+	// Nodes without the parity fields (older admin API) yield no roster;
+	// ingest must skip reconciliation for them.
 	if req.sandboxIDs != nil {
-		t.Fatalf("pull must leave sandboxIDs nil, got %v", req.sandboxIDs)
+		t.Fatalf("degraded pull must leave sandboxIDs nil, got %v", req.sandboxIDs)
+	}
+}
+
+const adminParityNodeFixture = `[{
+  "version": "0.2.0",
+  "commit": "abc123",
+  "id": "node-a",
+  "serviceInstanceID": "inst-1",
+  "clusterID": "cluster-1",
+  "sandboxCount": 2,
+  "createSuccesses": 10,
+  "createFails": 1,
+  "sandboxStartingCount": 1,
+  "sandboxPausedCount": 3,
+  "sandboxIDs": ["sbx-1", "sbx-paused"],
+  "p2pEndpoint": {"backend": "iroh", "address": "node-a.p2p.local"},
+  "machineInfo": {"cpuFamily": "6", "cpuModel": "85", "cpuModelName": "Xeon", "cpuArchitecture": "x86_64", "cpuConfigJSON": "{\"ht\":true}"},
+  "metrics": {
+    "allocatedCPU": 4,
+    "allocatedMemoryBytes": 8589934592,
+    "cpuPercent": 55,
+    "cpuCount": 16,
+    "memoryUsedBytes": 17179869184,
+    "memoryTotalBytes": 34359738368,
+    "pausedAllocatedCPU": 2,
+    "pausedAllocatedMemoryBytes": 4294967296,
+    "disks": [{"mountPoint": "/", "device": "/dev/ublkb0", "filesystemType": "ext4", "usedBytes": 1024, "totalBytes": 4096}]
+  }
+}]`
+
+// Parity path (#341 review): when the admin API exposes the heartbeat fields
+// (sandboxIDs, p2pEndpoint, cpuConfigJSON), the pull maps them through and
+// ingest reconciles bindings from the authoritative roster.
+func TestAdminSnapshotFetcherParityFields(t *testing.T) {
+	srv := adminTestServer(t, "", adminParityNodeFixture, "[]")
+	fetch := NewAdminSnapshotFetcher("")
+
+	req, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL})
+	if err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+	if len(req.sandboxIDs) != 2 || req.sandboxIDs[0] != "sbx-1" || req.sandboxIDs[1] != "sbx-paused" {
+		t.Fatalf("parity roster mapping wrong: %v", req.sandboxIDs)
+	}
+	if req.p2pEndpoint == nil || req.p2pEndpoint.GetBackend() != "iroh" || req.p2pEndpoint.GetAddress() != "node-a.p2p.local" {
+		t.Fatalf("parity p2p mapping wrong: %v", req.p2pEndpoint)
+	}
+	if req.machineInfo.GetCpuConfigJson() != `{"ht":true}` {
+		t.Fatalf("parity cpuConfigJSON mapping wrong: %q", req.machineInfo.GetCpuConfigJson())
+	}
+
+	svc, _, store := newTestService(t, []string{"node-a"})
+	if _, err := svc.ingestNodeReport(req, time.Now()); err != nil {
+		t.Fatalf("parity pull ingest failed: %v", err)
+	}
+	// The authoritative roster reconciles bindings, including the paused one.
+	for _, id := range []string{"sbx-1", "sbx-paused"} {
+		if _, ok, err := store.Get(id, time.Now()); err != nil || !ok {
+			t.Fatalf("parity pull must reconcile binding %s: ok=%v err=%v", id, ok, err)
+		}
 	}
 }
 

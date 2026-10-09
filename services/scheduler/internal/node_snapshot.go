@@ -146,18 +146,23 @@ func (r *ConcurrentNodeSnapshotRefresher) Refresh(ctx context.Context, nodes []N
 // adminNodeResponse mirrors the agentenv server admin GET /nodes entry
 // (openapi: Node). Field names follow the API's camelCase JSON.
 type adminNodeResponse struct {
-	Version            string `json:"version"`
-	Commit             string `json:"commit"`
-	ID                 string `json:"id"`
-	ServiceInstanceID  string `json:"serviceInstanceID"`
-	ClusterID          string `json:"clusterID"`
-	SandboxCount       uint32 `json:"sandboxCount"`
-	CreateSuccesses    uint64 `json:"createSuccesses"`
-	CreateFails        uint64 `json:"createFails"`
-	SandboxStartingCnt uint32 `json:"sandboxStartingCount"`
-	SandboxPausedCount uint32 `json:"sandboxPausedCount"`
-	Status             string `json:"status"`
-	MachineInfo        struct {
+	Version            string   `json:"version"`
+	Commit             string   `json:"commit"`
+	ID                 string   `json:"id"`
+	ServiceInstanceID  string   `json:"serviceInstanceID"`
+	ClusterID          string   `json:"clusterID"`
+	SandboxCount       uint32   `json:"sandboxCount"`
+	CreateSuccesses    uint64   `json:"createSuccesses"`
+	CreateFails        uint64   `json:"createFails"`
+	SandboxStartingCnt uint32   `json:"sandboxStartingCount"`
+	SandboxPausedCount uint32   `json:"sandboxPausedCount"`
+	Status             string   `json:"status"`
+	SandboxIDs         []string `json:"sandboxIDs"`
+	P2pEndpoint        *struct {
+		Backend string `json:"backend"`
+		Address string `json:"address"`
+	} `json:"p2pEndpoint"`
+	MachineInfo struct {
 		CPUFamily       string `json:"cpuFamily"`
 		CPUModel        string `json:"cpuModel"`
 		CPUModelName    string `json:"cpuModelName"`
@@ -273,6 +278,23 @@ func adminGetJSON(ctx context.Context, client *http.Client, apiKey, url string, 
 }
 
 func reportFromAdmin(n *adminNodeResponse, fetchedAt time.Time) *nodeReport {
+	// The admin roster is authoritative when present (same source as
+	// heartbeat sandbox_ids: orchestrator.list_sandbox_ids), so a parity
+	// pull may reconcile bindings; an absent roster stays nil and skips
+	// reconciliation (#341 review).
+	var sandboxIDs []string
+	if n.SandboxIDs != nil {
+		sandboxIDs = []string{}
+		for _, id := range n.SandboxIDs {
+			if strings.TrimSpace(id) != "" {
+				sandboxIDs = append(sandboxIDs, id)
+			}
+		}
+	}
+	var p2p *schedulerv1.P2PEndpoint
+	if n.P2pEndpoint != nil {
+		p2p = &schedulerv1.P2PEndpoint{Backend: n.P2pEndpoint.Backend, Address: n.P2pEndpoint.Address}
+	}
 	disks := make([]*schedulerv1.DiskMetric, 0, len(n.Metrics.Disks))
 	for _, d := range n.Metrics.Disks {
 		disks = append(disks, &schedulerv1.DiskMetric{
@@ -285,6 +307,8 @@ func reportFromAdmin(n *adminNodeResponse, fetchedAt time.Time) *nodeReport {
 	}
 	return &nodeReport{
 		nodeID:            n.ID,
+		sandboxIDs:        sandboxIDs,
+		p2pEndpoint:       p2p,
 		clusterID:         n.ClusterID,
 		serviceInstanceID: n.ServiceInstanceID,
 		version:           n.Version,
