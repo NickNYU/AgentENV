@@ -49,11 +49,26 @@ use uvm_ublk_daemon::{AccessMode, DaemonRequest, DaemonResponse, PoolConfig, Ubl
 
 const VIRTUAL_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 /// Same marker offset as the issue's reduced experiment (PUD index 0 of the
-/// faulting guest page-table walk).
+/// faulting guest page-table walk). Aligned to both 4 KiB and 64 KiB pages.
 const MARKER_OFFSET: u64 = 0x7ffce000;
-const PAGE: usize = 4096;
+/// Length of the marker content written into the image; independent of the
+/// host page size used for read buffers.
+const MARKER_LEN: usize = 4096;
 /// BLKFLSBUF ioctl request: Linux asm-generic/ioctl.h _IO(0x12, 97).
 const BLKFLSBUF: u32 = 0x1261;
+/// Deadline for any single RPC or blocking device operation: a stalled daemon
+/// or wedged ublk read must fail the test, never hang it.
+const IO_TIMEOUT: Duration = Duration::from_secs(30);
+/// Mirrors the daemon protocol's message size cap.
+const MAX_MESSAGE_SIZE: u32 = 16 * 1024 * 1024;
+
+/// Host page size, used for `O_DIRECT` buffer alignment and read sizing.
+/// Some kernels (e.g. arm64 builds) use 64 KiB pages instead of 4 KiB.
+fn host_page_size() -> usize {
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    assert!(size > 0, "sysconf(_SC_PAGESIZE) failed");
+    size as usize
+}
 
 /// Build a sealed LSMT lower of `virtual_size` bytes whose only content is a
 /// known nonzero page at `MARKER_OFFSET`, plus the read-only image config
@@ -66,7 +81,7 @@ async fn create_marker_image(dir: &Path) -> Result<PathBuf> {
     let info = LayerInfo::new(data_file, Some(index_file), VIRTUAL_SIZE);
     let lsmt = create_file_rw(info).await.context("create rw layer")?;
 
-    let mut page = vec![0u8; PAGE];
+    let mut page = vec![0u8; MARKER_LEN];
     page[..8].copy_from_slice(&MARKER_OFFSET.to_le_bytes());
     for (i, byte) in page.iter_mut().enumerate().skip(8) {
         *byte = ((i * 13 + 7) % 251) as u8;
@@ -103,15 +118,20 @@ fn write_global_config(dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Send one request on a fresh connection and return the response.
+/// Send one request on a fresh connection and return the response, bounded by
+/// `IO_TIMEOUT` so a stalled daemon cannot hang the test.
 async fn rpc(socket_path: &Path, request: &DaemonRequest) -> Result<DaemonResponse> {
-    let mut stream = UnixStream::connect(socket_path)
-        .await
-        .context("connect daemon socket")?;
-    send_message(&mut stream, request).await?;
-    recv_message(&mut stream)
-        .await?
-        .context("daemon closed connection without a response")
+    tokio::time::timeout(IO_TIMEOUT, async {
+        let mut stream = UnixStream::connect(socket_path)
+            .await
+            .context("connect daemon socket")?;
+        send_message(&mut stream, request).await?;
+        recv_message(&mut stream)
+            .await?
+            .context("daemon closed connection without a response")
+    })
+    .await
+    .context("daemon RPC timed out")?
 }
 
 async fn acquire(
@@ -147,51 +167,56 @@ async fn release(socket_path: &Path, dev_id: u32) -> Result<()> {
 }
 
 /// Run blocking device I/O off the async runtime workers so a stalled read or
-/// ioctl cannot delay the in-process daemon sharing this runtime.
+/// ioctl cannot delay the in-process daemon sharing this runtime. Bounded by
+/// `IO_TIMEOUT`: if the ublk read itself wedges, the test fails instead of
+/// hanging (the blocked thread is abandoned, which is acceptable in a test).
 async fn blocking<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
+    tokio::time::timeout(IO_TIMEOUT, tokio::task::spawn_blocking(f))
         .await
+        .context("blocking device I/O timed out")?
         .context("join blocking device I/O")?
 }
 
-/// Read `PAGE` bytes at `MARKER_OFFSET` with `O_DIRECT`, bypassing the page
+/// Read one host page at `MARKER_OFFSET` with `O_DIRECT`, bypassing the page
 /// cache. Buffer alignment is required by `O_DIRECT`.
 fn read_direct(device_path: &Path) -> Result<Vec<u8>> {
+    let page_size = host_page_size();
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECT)
         .open(device_path)
         .context("open device for O_DIRECT read")?;
-    let layout = Layout::from_size_align(PAGE, PAGE).expect("page layout");
+    let layout = Layout::from_size_align(page_size, page_size).expect("page layout");
     let raw = unsafe { std::alloc::alloc_zeroed(layout) };
     anyhow::ensure!(!raw.is_null(), "aligned page allocation failed");
     // The closure returns `Err` instead of panicking on short reads, and
     // `dealloc` runs unconditionally afterward, so the aligned page cannot
     // leak and I/O failures keep their context.
     let result = (|| -> Result<Vec<u8>> {
-        let buf = unsafe { std::slice::from_raw_parts_mut(raw, PAGE) };
+        let buf = unsafe { std::slice::from_raw_parts_mut(raw, page_size) };
         let n = file
             .read_at(buf, MARKER_OFFSET)
             .context("O_DIRECT read at marker offset")?;
-        anyhow::ensure!(n == PAGE, "short O_DIRECT read: {n} bytes");
+        anyhow::ensure!(n == page_size, "short O_DIRECT read: {n} bytes");
         Ok(buf.to_vec())
     })();
     unsafe { dealloc(raw, layout) };
     result
 }
 
-/// Read the marker page through a buffered FD, requiring a full page: a short
+/// Read one host page through a buffered FD, requiring a full page: a short
 /// read must fail loudly instead of passing with a partially zeroed buffer.
 fn read_buffered_page(file: &std::fs::File) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; PAGE];
+    let page_size = host_page_size();
+    let mut buf = vec![0u8; page_size];
     let n = file
         .read_at(&mut buf, MARKER_OFFSET)
         .context("buffered read at marker offset")?;
-    anyhow::ensure!(n == PAGE, "short buffered read: {n} bytes");
+    anyhow::ensure!(n == page_size, "short buffered read: {n} bytes");
     Ok(buf)
 }
 
@@ -225,20 +250,37 @@ fn first_u64le(page: &[u8]) -> u64 {
     u64::from_le_bytes(page[..8].try_into().expect("page prefix"))
 }
 
-/// Synchronous best-effort RPC for the cleanup guard: `Drop` may run during
-/// unwinding on a runtime thread, where async I/O is unavailable.
+/// Synchronous best-effort RPC for the cleanup guard, executed on the guard's
+/// dedicated thread (async I/O is unavailable in `Drop`). Read/write deadlines
+/// keep a wedged daemon from hanging the test process, and daemon-side error
+/// responses are surfaced instead of counting as successful cleanup.
 fn sync_rpc(socket_path: &Path, request: &DaemonRequest) -> Result<()> {
     use std::io::{Read, Write};
     let mut stream =
         std::os::unix::net::UnixStream::connect(socket_path).context("connect daemon socket")?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .context("set read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .context("set write timeout")?;
     let payload = serde_json::to_vec(request).context("serialize request")?;
     stream.write_all(&(payload.len() as u32).to_be_bytes())?;
     stream.write_all(&payload)?;
     let mut len = [0u8; 4];
     stream.read_exact(&mut len)?;
-    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    let len = u32::from_be_bytes(len);
+    anyhow::ensure!(len <= MAX_MESSAGE_SIZE, "daemon message too large: {len}");
+    let mut body = vec![0u8; len as usize];
     stream.read_exact(&mut body)?;
-    Ok(())
+    match serde_json::from_slice::<DaemonResponse>(&body).context("deserialize response")? {
+        DaemonResponse::Error { message }
+        | DaemonResponse::InvalidRequest { message }
+        | DaemonResponse::TerminalError { message } => {
+            anyhow::bail!("daemon reported an error: {message}")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Best-effort cleanup on every exit path: release the pooled device and shut
@@ -252,16 +294,30 @@ struct DaemonCleanup {
 
 impl Drop for DaemonCleanup {
     fn drop(&mut self) {
-        if let Some(dev_id) = self.dev_id.take() {
-            let _ = sync_rpc(
-                &self.socket_path,
-                &DaemonRequest::ReleaseOverlaybd { dev_id },
-            );
+        let socket_path = self.socket_path.clone();
+        let dev_id = self.dev_id.take();
+        let mut task = self.server_task.take();
+        if dev_id.is_none() && task.is_none() {
+            return;
         }
-        let _ = sync_rpc(&self.socket_path, &DaemonRequest::Shutdown);
-        if let Some(task) = self.server_task.take() {
-            task.abort();
-        }
+        // Run cleanup on a dedicated thread: `Drop` may execute on a runtime
+        // worker (including mid-unwind), where blocking RPCs must never run.
+        std::thread::spawn(move || {
+            if let Some(dev_id) = dev_id {
+                let _ = sync_rpc(&socket_path, &DaemonRequest::ReleaseOverlaybd { dev_id });
+            }
+            let _ = sync_rpc(&socket_path, &DaemonRequest::Shutdown);
+            if let Some(task) = task.as_mut() {
+                // The shutdown RPC replies before `stop_all_devices()` runs,
+                // so give the daemon a bounded window to tear down devices
+                // instead of aborting it mid-cleanup and leaking the device.
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !task.is_finished() && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                task.abort();
+            }
+        });
     }
 }
 
@@ -356,7 +412,9 @@ async fn pooled_device_must_not_serve_stale_placeholder_pages() -> Result<()> {
     );
 
     // Step 2: release; the device swaps to the zero placeholder and stays pooled.
+    // The guard must not release it a second time if a later step fails.
     release(&socket_path, dev_id).await?;
+    cleanup.dev_id = None;
 
     // Step 3: keep a buffered FD open across the reacquire, modeling a reader
     // whose cache lifetime spans the handover. Verify the placeholder reads
@@ -378,7 +436,7 @@ async fn pooled_device_must_not_serve_stale_placeholder_pages() -> Result<()> {
     };
     assert_eq!(
         idle_direct,
-        vec![0u8; PAGE],
+        vec![0u8; host_page_size()],
         "idle placeholder must read as zeros via O_DIRECT"
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -390,15 +448,17 @@ async fn pooled_device_must_not_serve_stale_placeholder_pages() -> Result<()> {
     retained_fd = fd;
     assert_eq!(
         idle_buffered,
-        vec![0u8; PAGE],
+        vec![0u8; host_page_size()],
         "idle placeholder must read as zeros via the buffered path"
     );
 
-    // Step 4: reacquire; the pool must hand back the same device.
+    // Step 4: reacquire; the pool must hand back the same device. Track the new
+    // device in the guard before asserting: if the assertions fail, cleanup
+    // must release the device we actually hold now, not the previous one.
     let (dev_id2, device_path2) = acquire(&socket_path, &image_config, &global_config).await?;
+    cleanup.dev_id = Some(dev_id2);
     assert_eq!(dev_id, dev_id2, "pool must reuse the same device");
     assert_eq!(device_path, device_path2);
-    cleanup.dev_id = Some(dev_id2);
 
     // Control: direct reads must see the business image again.
     let direct_after = {
