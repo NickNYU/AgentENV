@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,10 +43,18 @@ func main() {
 	}
 	defer logger.Sync()
 
-	// rootCancel lets a leadership loss drive the same graceful shutdown as a
-	// signal: the ex-leader exits and restarts as a standby (fencing, #259).
+	// rootCancel lets a leadership loss drive the shutdown path as a signal,
+	// but with an important difference (#341 review): on leadership loss the
+	// process force-stops instead of draining, so in-flight writes cannot
+	// overlap the next leader (no dual-writer window). leadershipLost tells
+	// the shutdown path which case it is in.
+	var leadershipLost atomic.Bool
 	rootCtx, rootCancel := context.WithCancel(context.Background())
 	defer rootCancel()
+	leadershipLossStop := func() {
+		leadershipLost.Store(true)
+		rootCancel()
+	}
 	sigCtx, stop := signal.NotifyContext(rootCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -63,6 +72,16 @@ func main() {
 	g := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptors...))
 	var registry *scheduler.AtomicNodeRegistry
 	var svc *scheduler.Service
+	// Closed once discovery has produced its first sync. Closed immediately
+	// unless leader election runs on kubernetes discovery — there, election
+	// must not start before the first informer sync, or an early acquisition
+	// would capture an empty registry and recover nothing (#341 review).
+	waitForDiscoverySync := cfg.Scheduler.LeaderElection.Enabled && !*queryOnly &&
+		strings.EqualFold(strings.TrimSpace(cfg.Scheduler.Discovery.Mode), "kubernetes")
+	discoveryReady := make(chan struct{})
+	if !waitForDiscoverySync {
+		close(discoveryReady)
+	}
 	if *queryOnly {
 		qo := scheduler.NewQueryOnlyService(logger, store)
 		schedulerv1.RegisterSchedulerServer(g, qo)
@@ -71,7 +90,7 @@ func main() {
 		registry = scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
 		switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
 		case "kubernetes":
-			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry)
+			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry, discoveryReady)
 		default:
 			nodes := make([]scheduler.Node, 0, len(cfg.Scheduler.Nodes))
 			for _, n := range cfg.Scheduler.Nodes {
@@ -106,8 +125,16 @@ func main() {
 	grpc_health_v1.RegisterHealthServer(g, hs)
 
 	leadership.BindRuntime(svc, registry)
+	if waitForDiscoverySync {
+		select {
+		case <-discoveryReady:
+		case <-time.After(30 * time.Second):
+			logger.Fatal("kubernetes discovery initial sync timed out before leader election")
+		case <-sigCtx.Done():
+		}
+	}
 	go func() {
-		if err := leadership.Run(sigCtx, rootCancel); err != nil {
+		if err := leadership.Run(sigCtx, leadershipLossStop); err != nil {
 			logger.Fatal("leader election failed", zap.Error(err))
 		}
 	}()
@@ -158,22 +185,30 @@ func main() {
 	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
 	leadership.MarkNotServing()
 
-	gracefulStopDone := make(chan struct{})
-	go func() {
-		g.GracefulStop()
-		close(gracefulStopDone)
-	}()
-
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
-
-	select {
-	case <-gracefulStopDone:
-		logger.Info("scheduler stopped gracefully")
-	case <-timer.C:
-		logger.Warn("scheduler graceful shutdown timed out; forcing stop")
+	if leadershipLost.Load() {
+		// Leadership loss: stop immediately. In-flight RPCs fail and clients
+		// retry onto the new leader — better than a dual-writer overlap
+		// (#341 review).
+		logger.Warn("leadership lost; forcing immediate stop to avoid dual-writer overlap")
 		g.Stop()
-		<-gracefulStopDone
+	} else {
+		gracefulStopDone := make(chan struct{})
+		go func() {
+			g.GracefulStop()
+			close(gracefulStopDone)
+		}()
+
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+
+		select {
+		case <-gracefulStopDone:
+			logger.Info("scheduler stopped gracefully")
+		case <-timer.C:
+			logger.Warn("scheduler graceful shutdown timed out; forcing stop")
+			g.Stop()
+			<-gracefulStopDone
+		}
 	}
 
 	metricsShutdownCtx, cancelMetricsShutdown := context.WithTimeout(context.Background(), 5*time.Second)
@@ -239,6 +274,7 @@ func runKubernetesDiscoveryWithRetry(
 	logger *zap.Logger,
 	cfg config.SchedulerDiscoveryKubernetesConfig,
 	registry *scheduler.AtomicNodeRegistry,
+	ready ...chan<- struct{},
 ) {
 	const (
 		initialBackoff = 1 * time.Second
@@ -254,7 +290,7 @@ func runKubernetesDiscoveryWithRetry(
 		}
 
 		attempt++
-		discovery, err := scheduler.NewKubernetesDiscovery(logger, cfg, registry)
+		discovery, err := scheduler.NewKubernetesDiscovery(logger, cfg, registry, ready...)
 		if err != nil {
 			if errors.Is(err, rest.ErrNotInCluster) {
 				logger.Error("kubernetes discovery initialization failed with non-retryable error; stopping discovery loop",

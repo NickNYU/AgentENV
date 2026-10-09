@@ -209,7 +209,15 @@ func adminStatusToProto(status string) schedulerv1.NodeStatus {
 // implementation detail with a bounded per-request timeout; tests inject
 // through the NodeSnapshotFetcher seam, not this constructor.
 func NewAdminSnapshotFetcher(apiKey string) NodeSnapshotFetcher {
-	client := &http.Client{Timeout: 5 * time.Second}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		// Never follow redirects: Go re-sends headers (including x-api-key)
+		// to the redirect target, which would leak the admin key (#341
+		// review). A redirect from a node admin API is an error, not a hint.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	return func(ctx context.Context, node Node) (*nodeReport, error) {
 		base := strings.TrimRight(node.Endpoint, "/")
 		// Stamp the capture time before the request: a heartbeat landing
