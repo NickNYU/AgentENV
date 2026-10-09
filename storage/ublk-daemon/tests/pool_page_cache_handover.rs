@@ -169,7 +169,12 @@ async fn release(socket_path: &Path, dev_id: u32) -> Result<()> {
 /// Run blocking device I/O off the async runtime workers so a stalled read or
 /// ioctl cannot delay the in-process daemon sharing this runtime. Bounded by
 /// `IO_TIMEOUT`: if the ublk read itself wedges, the test fails instead of
-/// hanging (the blocked thread is abandoned, which is acceptable in a test).
+/// hanging. A timeout cannot cancel an already-running blocking closure —
+/// that is inherent to `spawn_blocking`; the abandoned thread holds its FD
+/// until process exit and the runtime may wait for it during shutdown. That
+/// residue is accepted here: a truly wedged ublk read indicates a
+/// kernel-side fault, where failing loudly (and letting the CI job timeout
+/// kill the process) is the correct outcome.
 async fn blocking<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
@@ -290,6 +295,10 @@ struct DaemonCleanup {
     socket_path: PathBuf,
     dev_id: Option<u32>,
     server_task: Option<tokio::task::JoinHandle<Result<()>>>,
+    /// Owns the daemon's working directory. On error-path drops the directory
+    /// moves into the cleanup thread, so the socket path still exists while
+    /// the cleanup RPCs run and is removed only when that thread finishes.
+    workdir: Option<TempDir>,
 }
 
 impl Drop for DaemonCleanup {
@@ -300,9 +309,12 @@ impl Drop for DaemonCleanup {
         if dev_id.is_none() && task.is_none() {
             return;
         }
+        let workdir = self.workdir.take();
         // Run cleanup on a dedicated thread: `Drop` may execute on a runtime
         // worker (including mid-unwind), where blocking RPCs must never run.
         std::thread::spawn(move || {
+            // Removed when this thread finishes, never before the RPCs.
+            let _workdir = workdir;
             if let Some(dev_id) = dev_id {
                 let _ = sync_rpc(&socket_path, &DaemonRequest::ReleaseOverlaybd { dev_id });
             }
@@ -379,6 +391,7 @@ async fn pooled_device_must_not_serve_stale_placeholder_pages() -> Result<()> {
             socket_path: socket_path.clone(),
             dev_id: None,
             server_task: Some(task),
+            workdir: Some(tmp),
         }
     };
 
