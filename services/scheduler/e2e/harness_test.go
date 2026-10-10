@@ -9,6 +9,7 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strings"
@@ -71,12 +72,19 @@ func leaderIdentity(t *testing.T) string {
 	return strings.TrimSpace(out)
 }
 
+var currentForward *exec.Cmd
+
 // forwardLeader port-forwards to the current leader POD. kubectl port-forward
 // to a Service ignores readiness and can land on a gated standby (every RPC
 // rejected with "not the leader"), so tests must target the leader pod
-// directly and re-resolve it after every failover.
+// directly and re-resolve it after every failover. Any previous forward is
+// killed first, since the pod it targeted may have been deleted mid-test.
 func forwardLeader(t *testing.T) {
 	t.Helper()
+	if currentForward != nil {
+		_ = currentForward.Process.Kill()
+		currentForward = nil
+	}
 	leader := leaderIdentity(t)
 	if leader == "" {
 		t.Fatal("no leader elected yet")
@@ -85,10 +93,18 @@ func forwardLeader(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("port-forward to leader %s: %v", leader, err)
 	}
-	t.Cleanup(func() { _ = cmd.Process.Kill() })
-	deadline := time.Now().Add(10 * time.Second)
+	currentForward = cmd
+	t.Cleanup(func() {
+		if currentForward == cmd {
+			_ = cmd.Process.Kill()
+			currentForward = nil
+		}
+	})
+	// Probe the port with a real TCP dial: grpc.NewClient is lazy and would
+	// report ready long before kubectl has the tunnel up.
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := grpc.NewClient(schedAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:19090", 500*time.Millisecond)
 		if err == nil {
 			conn.Close()
 			return
@@ -159,6 +175,9 @@ func TestFailoverLeaderKill(t *testing.T) {
 	case <-time.After(2 * time.Second):
 	}
 
+	// The forward targeted the killed pod; re-forward and re-dial.
+	forwardLeader(t)
+	client = dial(t)
 	eventually(t, 30*time.Second, "scheduling works again on the new leader", func() (bool, error) {
 		_, err := client.Schedule(ctx, &schedulerv1.ScheduleRequest{})
 		return err == nil, nil
@@ -172,7 +191,7 @@ func TestPartitionFrozenLeader(t *testing.T) {
 	victim := leaderIdentity(t)
 	t.Logf("freezing leader process in pod %s (SIGSTOP = cannot renew)", victim)
 	out, err := exec.Command("kubectl", "debug", "-q", victim, "--image=busybox:1.36",
-		"--", "kill", "-STOP", "1").CombinedOutput()
+		"--", "sh", "-c", "kill -STOP $(pidof scheduler)").CombinedOutput()
 	if err != nil {
 		t.Fatalf("freeze leader via debug container failed: %v\n%s", err, out)
 	}
@@ -189,7 +208,7 @@ func TestPartitionFrozenLeader(t *testing.T) {
 	}
 
 	out, err = exec.Command("kubectl", "debug", "-q", victim, "--image=busybox:1.36",
-		"--", "kill", "-CONT", "1").CombinedOutput()
+		"--", "sh", "-c", "kill -CONT $(pidof scheduler)").CombinedOutput()
 	if err != nil {
 		t.Fatalf("resume leader via debug container failed: %v\n%s", err, out)
 	}
@@ -220,6 +239,10 @@ func TestTakeoverSchedulingSemantics(t *testing.T) {
 		cur := leaderIdentity(t)
 		return cur != "" && cur != victim, nil
 	})
+
+	// The forward targeted the killed pod; re-forward and re-dial.
+	forwardLeader(t)
+	client = dial(t)
 
 	// No node has freshly reported to the new leader: Unavailable, not a guess.
 	if _, err := client.Schedule(ctx, &schedulerv1.ScheduleRequest{}); err == nil {
@@ -259,6 +282,10 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 		cur := leaderIdentity(t)
 		return cur != "" && cur != victim, nil
 	})
+
+	// The forward targeted the killed pod; re-forward and re-dial.
+	forwardLeader(t)
+	client = dial(t)
 
 	// The client-side retry path: writing again must succeed on the new leader.
 	if _, err := client.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{
