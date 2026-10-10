@@ -55,9 +55,9 @@ data:
           "enabled": true,
           "lease_name": "agentenv-scheduler",
           "lease_namespace": "default",
-          "lease_duration": "6s",
-          "renew_deadline": "4s",
-          "retry_period": "1s"
+          "lease_duration": "15s",
+          "renew_deadline": "10s",
+          "retry_period": "2s"
         }
       }
     }

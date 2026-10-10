@@ -168,11 +168,11 @@ func TestFailoverLeaderKill(t *testing.T) {
 	t.Logf("killing leader pod %s", victim)
 	kube(t, "delete", "pod", victim, "--force", "--grace-period=0")
 
-	eventually(t, 30*time.Second, "a new leader", func() (bool, error) {
+	eventually(t, 60*time.Second, "a new leader", func() (bool, error) {
 		cur := leaderIdentity(t)
 		return cur != "" && cur != victim, nil
 	})
-	eventually(t, 30*time.Second, "endpoints converge on one leader", func() (bool, error) {
+	eventually(t, 60*time.Second, "endpoints converge on one leader", func() (bool, error) {
 		return len(schedulerEndpoints(t)) == 1, nil
 	})
 
@@ -185,7 +185,7 @@ func TestFailoverLeaderKill(t *testing.T) {
 	// The forward targeted the killed pod; re-forward and re-dial.
 	forwardLeader(t)
 	client = dial(t)
-	eventually(t, 30*time.Second, "scheduling works again on the new leader", func() (bool, error) {
+	eventually(t, 60*time.Second, "scheduling works again on the new leader", func() (bool, error) {
 		_, err := client.Schedule(ctx, &schedulerv1.ScheduleRequest{})
 		return err == nil, nil
 	})
@@ -203,7 +203,7 @@ func TestPartitionFrozenLeader(t *testing.T) {
 		t.Fatalf("freeze leader via debug container failed: %v\n%s", err, out)
 	}
 
-	eventually(t, 45*time.Second, "standby takes over while old leader frozen", func() (bool, error) {
+	eventually(t, 60*time.Second, "standby takes over while old leader frozen", func() (bool, error) {
 		cur := leaderIdentity(t)
 		return cur != "" && cur != victim, nil
 	})
@@ -221,11 +221,11 @@ func TestPartitionFrozenLeader(t *testing.T) {
 	}
 	// With egress restored, the ex-leader's renew failure has already fired
 	// OnStoppedLeading: it force-stops and its pod restarts as standby.
-	eventually(t, 60*time.Second, "frozen ex-leader exits (pod restarts)", func() (bool, error) {
+	eventually(t, 90*time.Second, "frozen ex-leader exits (pod restarts)", func() (bool, error) {
 		out := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}")
 		return out != "0", nil
 	})
-	eventually(t, 30*time.Second, "still exactly one leader after resume", func() (bool, error) {
+	eventually(t, 60*time.Second, "still exactly one leader after resume", func() (bool, error) {
 		return len(schedulerEndpoints(t)) == 1, nil
 	})
 }
@@ -246,7 +246,7 @@ func TestTakeoverSchedulingSemantics(t *testing.T) {
 	victim := leaderIdentity(t)
 	kube(t, "delete", "pod", victim, "--force", "--grace-period=0")
 
-	eventually(t, 30*time.Second, "new leader", func() (bool, error) {
+	eventually(t, 60*time.Second, "new leader", func() (bool, error) {
 		cur := leaderIdentity(t)
 		return cur != "" && cur != victim, nil
 	})
@@ -262,7 +262,7 @@ func TestTakeoverSchedulingSemantics(t *testing.T) {
 
 	stubPost(t, "control/resume", "")
 	stubPost(t, "control/admin-resume", "")
-	eventually(t, 30*time.Second, "scheduling recovers once pull and heartbeats resume", func() (bool, error) {
+	eventually(t, 60*time.Second, "scheduling recovers once pull and heartbeats resume", func() (bool, error) {
 		_, err := client.Schedule(ctx, &schedulerv1.ScheduleRequest{})
 		return err == nil, nil
 	})
@@ -290,7 +290,7 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	writeErr := <-done
 	t.Logf("write during takeover returned: %v", writeErr)
 
-	eventually(t, 30*time.Second, "new leader", func() (bool, error) {
+	eventually(t, 60*time.Second, "new leader", func() (bool, error) {
 		cur := leaderIdentity(t)
 		return cur != "" && cur != victim, nil
 	})
