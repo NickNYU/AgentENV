@@ -50,7 +50,9 @@ jobs:
           kubectl apply -f services/scheduler/e2e/k8s/stubnodes.yaml
           kubectl rollout status deployment/redis --timeout=120s
           kubectl rollout status deployment/stubnode --timeout=120s
-          kubectl rollout status deployment/agentenv-scheduler --timeout=180s
+          # NOTE: do not rollout-status the scheduler Deployment — by HA
+          # design only the elected leader is Ready, so a full rollout can
+          # never complete. The "Wait for a leader" step below is the gate.
 
       - name: Wait for a leader
         run: |
