@@ -210,11 +210,15 @@ func TestPartitionFrozenLeader(t *testing.T) {
 		return cur != "" && cur != victim, nil
 	})
 
-	// While frozen, there must be exactly one serving endpoint.
-	eps := schedulerEndpoints(t)
-	if len(eps) != 1 {
-		t.Fatalf("expected exactly one endpoint during partition, got %v", eps)
-	}
+	// The Lease flips before readiness does, so zero endpoints is the
+	// correct transient — wait for the new leader's probe to flip SERVING.
+	eventually(t, 60*time.Second, "exactly one ready endpoint while old leader frozen", func() (bool, error) {
+		eps := schedulerEndpoints(t)
+		if len(eps) > 1 {
+			return false, fmt.Errorf("more than one ready endpoint: %v", eps)
+		}
+		return len(eps) == 1, nil
+	})
 
 	out, err = exec.Command("kubectl", "debug", "-q", victim, "--image=busybox:1.36",
 		"--", "sh", "-c", "kill -CONT $(pidof scheduler)").CombinedOutput()
