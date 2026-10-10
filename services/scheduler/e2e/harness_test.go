@@ -116,8 +116,10 @@ func forwardLeader(t *testing.T) {
 
 func schedulerEndpoints(t *testing.T) []string {
 	t.Helper()
+	// EndpointSlice lists not-ready addresses too; filter by the ready
+	// condition, or standbys always show up in the count.
 	out := kube(t, "get", "endpointslice", "-l", "kubernetes.io/service-name=agentenv-scheduler",
-		"-o", "jsonpath={.items[*].endpoints[*].targetRef.name}")
+		"-o", "jsonpath={.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}")
 	var names []string
 	for _, f := range strings.Fields(out) {
 		if strings.HasPrefix(f, "agentenv-scheduler-") {
