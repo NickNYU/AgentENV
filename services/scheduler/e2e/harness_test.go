@@ -24,13 +24,6 @@ import (
 
 var schedAddr = envOr("E2E_SCHED_ADDR", "127.0.0.1:19090")
 
-func writeFile(t *testing.T, path, content string) {
-	t.Helper()
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
-}
-
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -78,6 +71,33 @@ func leaderIdentity(t *testing.T) string {
 	return strings.TrimSpace(out)
 }
 
+// forwardLeader port-forwards to the current leader POD. kubectl port-forward
+// to a Service ignores readiness and can land on a gated standby (every RPC
+// rejected with "not the leader"), so tests must target the leader pod
+// directly and re-resolve it after every failover.
+func forwardLeader(t *testing.T) {
+	t.Helper()
+	leader := leaderIdentity(t)
+	if leader == "" {
+		t.Fatal("no leader elected yet")
+	}
+	cmd := exec.Command("kubectl", "port-forward", "pod/"+leader, "19090:9090")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("port-forward to leader %s: %v", leader, err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := grpc.NewClient(schedAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err == nil {
+			conn.Close()
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	t.Fatalf("port-forward to leader %s never came up", leader)
+}
+
 func schedulerEndpoints(t *testing.T) []string {
 	t.Helper()
 	out := kube(t, "get", "endpoints", "agentenv-scheduler", "-o", "jsonpath={.subsets[*].addresses[*].targetRef.name}")
@@ -88,6 +108,7 @@ func schedulerEndpoints(t *testing.T) []string {
 // budget, pre-existing bindings keep resolving through Redis, and
 // scheduling resumes on freshly observed nodes.
 func TestFailoverLeaderKill(t *testing.T) {
+	forwardLeader(t)
 	client := dial(t)
 	ctx := context.Background()
 
@@ -149,34 +170,29 @@ func TestFailoverLeaderKill(t *testing.T) {
 // serving as a second primary.
 func TestPartitionFrozenLeader(t *testing.T) {
 	victim := leaderIdentity(t)
-	t.Logf("partitioning leader pod %s from the API (egress block)", victim)
-	kube(t, "label", "pod", victim, "e2e-partition=true", "--overwrite")
-	writeFile(t, "/tmp/e2e-netpol.yaml", `apiVersion: networking.k8s.io/v1
-kind: NetworkPolicy
-metadata:
-  name: e2e-partition
-spec:
-  podSelector:
-    matchLabels:
-      e2e-partition: "true"
-  policyTypes: ["Egress"]
-  egress: []
-`)
-	kube(t, "apply", "-f", "/tmp/e2e-netpol.yaml")
-	t.Cleanup(func() { kube(t, "delete", "networkpolicy", "e2e-partition", "--ignore-not-found") })
+	t.Logf("freezing leader process in pod %s (SIGSTOP = cannot renew)", victim)
+	out, err := exec.Command("kubectl", "debug", "-q", victim, "--image=busybox:1.36",
+		"--", "kill", "-STOP", "1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("freeze leader via debug container failed: %v\n%s", err, out)
+	}
 
-	eventually(t, 45*time.Second, "standby takes over while old leader partitioned", func() (bool, error) {
+	eventually(t, 45*time.Second, "standby takes over while old leader frozen", func() (bool, error) {
 		cur := leaderIdentity(t)
 		return cur != "" && cur != victim, nil
 	})
 
-	// While partitioned, there must be exactly one serving endpoint.
+	// While frozen, there must be exactly one serving endpoint.
 	eps := schedulerEndpoints(t)
 	if len(eps) != 1 {
 		t.Fatalf("expected exactly one endpoint during partition, got %v", eps)
 	}
 
-	kube(t, "delete", "networkpolicy", "e2e-partition")
+	out, err = exec.Command("kubectl", "debug", "-q", victim, "--image=busybox:1.36",
+		"--", "kill", "-CONT", "1").CombinedOutput()
+	if err != nil {
+		t.Fatalf("resume leader via debug container failed: %v\n%s", err, out)
+	}
 	// With egress restored, the ex-leader's renew failure has already fired
 	// OnStoppedLeading: it force-stops and its pod restarts as standby.
 	eventually(t, 60*time.Second, "frozen ex-leader exits (pod restarts)", func() (bool, error) {
@@ -192,6 +208,7 @@ spec:
 // return Unavailable (never fall back to unobserved nodes); once heartbeats
 // resume, scheduling recovers.
 func TestTakeoverSchedulingSemantics(t *testing.T) {
+	forwardLeader(t)
 	client := dial(t)
 	ctx := context.Background()
 
@@ -220,6 +237,7 @@ func TestTakeoverSchedulingSemantics(t *testing.T) {
 // commit after the takeover; the client retries and succeeds on the new
 // leader.
 func TestDemotedLeaderDelayedWrite(t *testing.T) {
+	forwardLeader(t)
 	client := dial(t)
 	ctx := context.Background()
 

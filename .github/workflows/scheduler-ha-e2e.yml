@@ -67,10 +67,6 @@ jobs:
 
       - name: Run failover tests
         run: |
-          kubectl port-forward svc/agentenv-scheduler 19090:9090 &
-          PF_PID=$!
-          trap "kill $PF_PID 2>/dev/null || true" EXIT
-          sleep 3
           cd services
           go test -tags e2e -count=1 -timeout 10m -v ./scheduler/e2e/...
 
