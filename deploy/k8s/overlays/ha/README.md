@@ -9,8 +9,15 @@ Traffic rules:
 
 1. Node heartbeats → `agentenv-scheduler` Service (leader only).
 2. Gateway writes (`Schedule`, `RecordAssignment`) → same Service.
-3. Gateway reads (`LookupNode`) → same Service; served by standbys when
-   `scheduler.redis_addr` is set, otherwise retried onto the leader.
+3. Gateway reads (`LookupNode`) → same Service, answered by the leader.
+
+Read gap on failover: because endpoints contain only the leader, lookups
+fail fast from the leader's death until the new leader is ready
+(~lease_duration + election + probe, roughly 15–25s with defaults). With
+`scheduler.redis_addr` bindings survive (TTL floored to
+`lease_duration + 90s`) and lookups resume automatically; without it,
+pre-failover bindings are lost (degraded mode). See "Failover read gap"
+in services/README.md.
 
 Deploy:
 

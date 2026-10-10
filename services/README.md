@@ -112,14 +112,20 @@ General config notes:
 
 `scheduler.leader_election` enables Kubernetes Lease-based leader election (#259). Off by default; with it off, the scheduler behaves exactly as a single-writer process.
 
-- With it on, N replicas compete for a `coordination.k8s.io/Lease`. Exactly one leader schedules and processes heartbeats; standbys stay liveness-healthy, reject writes with `Unavailable`, and serve `LookupNode`/`GetNode` from the shared Redis bindings (reads are rejected too when no `redis_addr` is set, and clients retry onto the leader).
+- With it on, N replicas compete for a `coordination.k8s.io/Lease`. Exactly one leader schedules and processes heartbeats; standbys stay liveness-healthy and reject writes with `Unavailable` (standbys may serve reads from the shared Redis bindings at the gate level, but with leader-only endpoints they receive no traffic — see the read gap below).
 - Readiness probes should target the leader-specific health service `scheduler.v1.Scheduler/leader` (`grpc_health_probe -service=scheduler.v1.Scheduler/leader`) so Service endpoints contain only the leader. Liveness keeps probing the overall health status.
-- Traffic rules: node heartbeats → scheduler Service (leader only); gateway writes (`Schedule`, `RecordAssignment`) → same Service; gateway reads (`LookupNode`) → same Service, answered by standbys when Redis is configured.
+- Traffic rules: node heartbeats → scheduler Service (leader only); gateway writes (`Schedule`, `RecordAssignment`) → same Service; gateway reads (`LookupNode`) → same Service, answered by the leader.
 - On failover, the new leader pulls each node's admin `/nodes` snapshot (sync-node-snapshots) instead of waiting for the next heartbeat; pulls authenticate with the `x-api-key` from `SCHEDULER_NODE_ADMIN_API_KEY` — pass it via env/Secret (the HA overlay mounts the shared `agentenv-auth` Secret), not via config files.
 - `redis_addr` is optional but recommended: without it, failover loses routing for pre-failover sandboxes (documented degraded mode). Under election the binding TTL is floored to `lease_duration + 90s` so bindings outlive the failover budget.
 - Mutually exclusive with `--query-only`. Ready-made manifests: `deploy/k8s/overlays/ha` (see its README for upgrade ordering).
 
-### Scheduling strategy
+#### Failover read gap (lookup continuity)
+
+Because Service endpoints contain only the leader, `LookupNode` is served only by the leader. During failover there is a read gap: from the leader's death until the new leader's readiness flips, the Service has zero ready endpoints and lookups fail fast (connection refused). With default timings (`lease_duration=15s`) the window is roughly 15–25s (detection + election + readiness probe).
+
+- With `redis_addr`: bindings survive — under election the binding TTL is floored to `lease_duration + 90s`, deliberately covering the worst-case failover budget (detection + endpoint propagation + one reporter reconnect backoff). Lookups resume automatically and correctly once the new leader is ready; live sandboxes are never misreported as NotFound.
+- Without `redis_addr` (degraded mode): bindings die with the old leader's process, so lookups for pre-failover sandboxes keep failing after the gap until those sandboxes are recreated. New scheduling is unaffected.
+- Closing the gap entirely (standbys serving reads) is an open design fork under review in #341; this section describes the shipped behavior.
 
 `scheduler.strategy` selects the algorithm used to pick a node from the eligible candidate list. Built-in strategies:
 
