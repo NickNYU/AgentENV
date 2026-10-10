@@ -116,8 +116,15 @@ func forwardLeader(t *testing.T) {
 
 func schedulerEndpoints(t *testing.T) []string {
 	t.Helper()
-	out := kube(t, "get", "endpoints", "agentenv-scheduler", "-o", "jsonpath={.subsets[*].addresses[*].targetRef.name}")
-	return strings.Fields(out)
+	out := kube(t, "get", "endpointslice", "-l", "kubernetes.io/service-name=agentenv-scheduler",
+		"-o", "jsonpath={.items[*].endpoints[*].targetRef.name}")
+	var names []string
+	for _, f := range strings.Fields(out) {
+		if strings.HasPrefix(f, "agentenv-scheduler-") {
+			names = append(names, f)
+		}
+	}
+	return names
 }
 
 // T1: kill the leader pod — a standby must take over within the lease
@@ -223,15 +230,19 @@ func TestPartitionFrozenLeader(t *testing.T) {
 	})
 }
 
-// T3: right after takeover, with node heartbeats paused, scheduling must
-// return Unavailable (never fall back to unobserved nodes); once heartbeats
-// resume, scheduling recovers.
+// T3: with node heartbeats paused AND the admin pull failing, scheduling
+// right after takeover must return Unavailable (never fall back to
+// unobserved nodes); once both resume, the pull-driven rebuild makes
+// scheduling work again.
 func TestTakeoverSchedulingSemantics(t *testing.T) {
 	forwardLeader(t)
 	client := dial(t)
 	ctx := context.Background()
 
+	// Zero fresh observations requires both channels down: heartbeats alone
+	// are not enough, since sync-node-snapshots rebuilds via the admin pull.
 	stubPost(t, "control/pause", "")
+	stubPost(t, "control/admin-pause", "")
 	victim := leaderIdentity(t)
 	kube(t, "delete", "pod", victim, "--force", "--grace-period=0")
 
@@ -244,13 +255,14 @@ func TestTakeoverSchedulingSemantics(t *testing.T) {
 	forwardLeader(t)
 	client = dial(t)
 
-	// No node has freshly reported to the new leader: Unavailable, not a guess.
+	// No fresh observations from either channel: Unavailable, not a guess.
 	if _, err := client.Schedule(ctx, &schedulerv1.ScheduleRequest{}); err == nil {
 		t.Fatal("schedule must fail with Unavailable before fresh observations, not guess capacity")
 	}
 
 	stubPost(t, "control/resume", "")
-	eventually(t, 30*time.Second, "scheduling recovers after heartbeats resume", func() (bool, error) {
+	stubPost(t, "control/admin-resume", "")
+	eventually(t, 30*time.Second, "scheduling recovers once pull and heartbeats resume", func() (bool, error) {
 		_, err := client.Schedule(ctx, &schedulerv1.ScheduleRequest{})
 		return err == nil, nil
 	})

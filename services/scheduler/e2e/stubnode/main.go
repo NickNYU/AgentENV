@@ -28,6 +28,7 @@ type stubState struct {
 	sandboxCount    uint32
 	cpuPercent      uint32
 	pauseHeartbeats bool
+	pauseAdmin      bool
 }
 
 type stub struct {
@@ -70,6 +71,8 @@ func main() {
 	mux.HandleFunc("POST /control/sandboxes", s.handleSetSandboxes)
 	mux.HandleFunc("POST /control/pause", s.handlePause)
 	mux.HandleFunc("POST /control/resume", s.handleResume)
+	mux.HandleFunc("POST /control/admin-pause", s.handleAdminPause)
+	mux.HandleFunc("POST /control/admin-resume", s.handleAdminResume)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
 
 	log.Printf("stubnode %s listening on %s, heartbeating to %s", *id, *listen, *schedulerAddr)
@@ -87,6 +90,13 @@ func (s *stub) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.apiKey != "" && r.Header.Get("x-api-key") != s.apiKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		s.state.mu.Lock()
+		paused := s.state.pauseAdmin
+		s.state.mu.Unlock()
+		if paused {
+			http.Error(w, "admin paused", http.StatusServiceUnavailable)
 			return
 		}
 		next(w, r)
@@ -225,6 +235,20 @@ func (s *stub) handlePause(w http.ResponseWriter, _ *http.Request) {
 func (s *stub) handleResume(w http.ResponseWriter, _ *http.Request) {
 	s.state.mu.Lock()
 	s.state.pauseHeartbeats = false
+	s.state.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *stub) handleAdminPause(w http.ResponseWriter, _ *http.Request) {
+	s.state.mu.Lock()
+	s.state.pauseAdmin = true
+	s.state.mu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *stub) handleAdminResume(w http.ResponseWriter, _ *http.Request) {
+	s.state.mu.Lock()
+	s.state.pauseAdmin = false
 	s.state.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
 }
