@@ -157,9 +157,6 @@ func (d *KubernetesDiscovery) Run(ctx context.Context) error {
 
 	syncCtx, cancelSync := context.WithTimeout(ctx, kubernetesDiscoveryCacheSyncTimeout)
 	defer cancelSync()
-	if len(d.ready) > 0 {
-		defer close(d.ready[0])
-	}
 	if !cache.WaitForCacheSync(syncCtx.Done(), cacheSyncs...) {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -167,7 +164,11 @@ func (d *KubernetesDiscovery) Run(ctx context.Context) error {
 		if err := syncCtx.Err(); err != nil {
 			return fmt.Errorf("kubernetes discovery cache sync timed out after %s", kubernetesDiscoveryCacheSyncTimeout)
 		}
-		return fmt.Errorf("kubernetes discovery cache sync failed")
+	}
+	// Signal first sync right after it completes — deferring this to Run's
+	// return would never fire during normal operation (#341 e2e finding).
+	if len(d.ready) > 0 {
+		close(d.ready[0])
 	}
 
 	d.syncFromStore()
