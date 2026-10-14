@@ -204,6 +204,9 @@ func TestFailoverLeaderKill(t *testing.T) {
 // serving as a second primary.
 func TestPartitionFrozenLeader(t *testing.T) {
 	victim := leaderIdentity(t)
+	// restartCount is cumulative over the pod's life; compare against the
+	// baseline, never zero (see TestDemotedLeaderDelayedWrite).
+	restartsAtStart := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}")
 	t.Logf("freezing leader process in pod %s (SIGSTOP = cannot renew)", victim)
 	out, err := exec.Command("kubectl", "debug", "-q", victim, "--image=busybox:1.36",
 		"--", "sh", "-c", "kill -STOP $(pidof scheduler)").CombinedOutput()
@@ -235,7 +238,7 @@ func TestPartitionFrozenLeader(t *testing.T) {
 	// OnStoppedLeading: it force-stops and its pod restarts as standby.
 	eventually(t, 90*time.Second, "frozen ex-leader exits (pod restarts)", func() (bool, error) {
 		out := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}")
-		return out != "0", nil
+		return out != restartsAtStart, nil
 	})
 	eventually(t, 60*time.Second, "still exactly one leader after resume", func() (bool, error) {
 		return len(schedulerEndpoints(t)) == 1, nil
@@ -311,6 +314,11 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	if err := iptables("-A"); err != nil {
 		t.Fatalf("add API-isolation rule: %v", err)
 	}
+	// restartCount is cumulative over the pod's life and earlier tests (and
+	// deploy-time crashloops) legitimately restart containers — compare
+	// against the baseline, never against zero (run 38498840011: the victim
+	// already had 2 restarts and the probe short-circuited every poll).
+	restartsAtStart := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}")
 	t.Cleanup(func() {
 		// The rule lives in the pod's network namespace and survives the
 		// container restart below; remove it so the pod rejoins the election.
@@ -339,7 +347,7 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	// deadline (10s), so a restart during this probe means the live window
 	// was missed.
 	eventually(t, 8*time.Second, "live demoted leader's gate rejects the delayed write", func() (bool, error) {
-		if out := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}"); out != "0" {
+		if out := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}"); out != restartsAtStart {
 			return false, fmt.Errorf("victim restarted before its live gate could be probed")
 		}
 		_, err := demoted.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{
@@ -372,7 +380,7 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	// standby; the cluster converges back to one serving leader.
 	eventually(t, 90*time.Second, "API-blind ex-leader exits (container restarts)", func() (bool, error) {
 		out := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}")
-		return out != "0", nil
+		return out != restartsAtStart, nil
 	})
 	eventually(t, 60*time.Second, "still exactly one leader after the ex-leader rejoins", func() (bool, error) {
 		return len(schedulerEndpoints(t)) == 1, nil
