@@ -69,16 +69,14 @@ func main() {
 	g := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptors...))
 	var registry *scheduler.AtomicNodeRegistry
 	var svc *scheduler.Service
-	// Closed once discovery has produced its first sync. Closed immediately
-	// unless leader election runs on kubernetes discovery — there, election
-	// must not start before the first informer sync, or an early acquisition
-	// would capture an empty registry and recover nothing (#341 review).
+	// Election on kubernetes discovery must not start before the first
+	// informer sync, or an early acquisition would capture an empty registry
+	// and recover nothing (#341 review). The ready channel exists only in
+	// that mode: discovery owns the close, and a caller-side close would
+	// panic as "close of closed channel" (#341 review, guozy18).
 	waitForDiscoverySync := cfg.Scheduler.LeaderElection.Enabled && !*queryOnly &&
 		strings.EqualFold(strings.TrimSpace(cfg.Scheduler.Discovery.Mode), "kubernetes")
-	discoveryReady := make(chan struct{})
-	if !waitForDiscoverySync {
-		close(discoveryReady)
-	}
+	discoveryReady, discoveryReadyChans := discoveryReadyFor(waitForDiscoverySync)
 	if *queryOnly {
 		qo := scheduler.NewQueryOnlyService(logger, store)
 		schedulerv1.RegisterSchedulerServer(g, qo)
@@ -87,7 +85,7 @@ func main() {
 		registry = scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
 		switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
 		case "kubernetes":
-			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry, discoveryReady)
+			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry, discoveryReadyChans...)
 		default:
 			nodes := make([]scheduler.Node, 0, len(cfg.Scheduler.Nodes))
 			for _, n := range cfg.Scheduler.Nodes {
