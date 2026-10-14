@@ -330,20 +330,28 @@ func nodeReportFromProto(req *schedulerv1.HeartbeatRequest) *nodeReport {
 // update registry observations, then reconcile sandbox bindings.
 func (s *Service) ingestNodeReport(report *nodeReport, now time.Time) (*schedulerv1.HeartbeatResponse, error) {
 	req := report.toHeartbeatRequest()
-	if !report.fetchedAt.IsZero() {
-		// Pulled report: skip when the node already reported something
-		// newer (#341 review). The residual check-then-act window is
-		// microseconds and self-heals on the next heartbeat.
-		if at, ok := s.nodes.LastReportAt(report.nodeID); ok && at.After(report.fetchedAt) {
-			return &schedulerv1.HeartbeatResponse{}, nil
-		}
+	var node Node
+	var cpuConfigJSON string
+	var err error
+	if report.fetchedAt.IsZero() {
+		node, cpuConfigJSON, err = s.nodes.Heartbeat(req, now)
+	} else {
 		// The admin API does not serve the P2P endpoint; carry over the
 		// previously known one so a pull does not erase it (#341 review).
 		if req.P2PEndpoint == nil {
 			req.P2PEndpoint = s.nodes.P2PEndpointFor(report.nodeID)
 		}
+		// Pulled report: the registry applies it only when it is not older
+		// than the node's latest report — check and update are one locked
+		// step, so a heartbeat landing mid-ingest always wins (#341 review,
+		// guozy18). A skipped pull must not reconcile either: its roster is
+		// just as stale and would delete bindings the heartbeat affirmed.
+		var applied bool
+		node, cpuConfigJSON, applied, err = s.nodes.IngestPulled(req, report.fetchedAt, now)
+		if err == nil && !applied {
+			return &schedulerv1.HeartbeatResponse{}, nil
+		}
 	}
-	node, cpuConfigJSON, err := s.nodes.Heartbeat(req, now)
 	if err != nil {
 		return nil, ingestNodeError(s.logger, report.nodeID, err)
 	}
