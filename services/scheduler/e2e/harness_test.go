@@ -102,16 +102,22 @@ func forwardLeader(t *testing.T) {
 	})
 	// Probe the port with a real TCP dial: grpc.NewClient is lazy and would
 	// report ready long before kubectl has the tunnel up.
+	waitForTCPPort(t, "127.0.0.1:19090", "port-forward to leader "+leader)
+}
+
+// waitForTCPPort blocks until a local port-forward accepts TCP connections.
+func waitForTCPPort(t *testing.T, addr, what string) {
+	t.Helper()
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", "127.0.0.1:19090", 500*time.Millisecond)
+		conn, err := net.DialTimeout("tcp", addr, 500*time.Millisecond)
 		if err == nil {
 			conn.Close()
 			return
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
-	t.Fatalf("port-forward to leader %s never came up", leader)
+	t.Fatalf("%s never came up", what)
 }
 
 func schedulerEndpoints(t *testing.T) []string {
@@ -274,41 +280,53 @@ func TestTakeoverSchedulingSemantics(t *testing.T) {
 	})
 }
 
-// T4 (guozy's R3 delayed-write case): a demoted-but-alive leader must not
-// commit a delayed write. Freeze the leader, let the standby take over,
-// resume it — while it still believes it leads, its gate must start
-// rejecting writes as soon as the holder check notices the new holder,
-// and a write through the new leader must succeed.
+// T4 (guozy's R3 delayed-write case, yingdi-shan's review ⑤): a
+// demoted-but-ALIVE leader must stop serving. Cut the leader off from the
+// API server (iptables REJECT from an ephemeral netadmin container — Kind's
+// kindnet ignores NetworkPolicy): the process stays alive and keeps its
+// local leader flag, but its holder check fails closed within seconds, so
+// the gate rejects the delayed write while the process is still running.
+// The standby then takes over and serves the same write, and once the renew
+// deadline passes the ex-leader force-stops (issue ②) and restarts as
+// standby. A freeze/resume (SIGSTOP/SIGCONT) cannot probe this: on resume
+// the renew timer fires immediately, so the process exits within
+// milliseconds — before any probe can reach it (run 38496719364).
 func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	ctx := context.Background()
 
-	// Freeze the leader so it cannot renew; the standby takes over.
 	victim := leaderIdentity(t)
-	out, err := exec.Command("kubectl", "debug", "-q", victim, "--image=busybox:1.36",
-		"--", "sh", "-c", "kill -STOP $(pidof scheduler)").CombinedOutput()
-	if err != nil {
-		t.Fatalf("freeze leader via debug container failed: %v\n%s", err, out)
+	apiIP := kube(t, "get", "svc", "kubernetes", "-n", "default", "-o", "jsonpath={.spec.clusterIP}")
+	t.Logf("isolating leader %s from the API server (%s)", victim, apiIP)
+
+	iptables := func(action string) error {
+		out, err := exec.Command("kubectl", "debug", "-q", victim,
+			"--image=nicolaka/netshoot:latest", "--profile=netadmin",
+			"--", "iptables", action, "OUTPUT", "-p", "tcp", "-d", apiIP,
+			"-j", "REJECT", "--reject-with", "tcp-reset").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("iptables %s on %s: %v\n%s", action, victim, err, out)
+		}
+		return nil
 	}
-	eventually(t, 60*time.Second, "standby takes over", func() (bool, error) {
-		cur := leaderIdentity(t)
-		return cur != "" && cur != victim, nil
+	if err := iptables("-A"); err != nil {
+		t.Fatalf("add API-isolation rule: %v", err)
+	}
+	t.Cleanup(func() {
+		// The rule lives in the pod's network namespace and survives the
+		// container restart below; remove it so the pod rejoins the election.
+		if err := iptables("-D"); err != nil {
+			t.Logf("cleanup: remove API-isolation rule: %v", err)
+		}
 	})
 
-	// Resume the demoted leader. It still believes it leads (renew has not
-	// failed yet); its gate must flip to rejecting within the holder-check
-	// period — that is the dual-leader window closing.
-	out, err = exec.Command("kubectl", "debug", "-q", victim, "--image=busybox:1.36",
-		"--", "sh", "-c", "kill -CONT $(pidof scheduler)").CombinedOutput()
-	if err != nil {
-		t.Fatalf("resume leader via debug container failed: %v\n%s", err, out)
-	}
-
+	// Talk to the demoted leader directly; the Service only routes to the
+	// ready leader.
 	demotedCmd := exec.Command("kubectl", "port-forward", "pod/"+victim, "19091:9090")
 	if err := demotedCmd.Start(); err != nil {
 		t.Fatalf("port-forward to demoted leader: %v", err)
 	}
 	defer func() { _ = demotedCmd.Process.Kill() }()
-	time.Sleep(2 * time.Second)
+	waitForTCPPort(t, "127.0.0.1:19091", "port-forward to demoted leader "+victim)
 	demotedConn, err := grpc.NewClient("127.0.0.1:19091", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatalf("dial demoted leader: %v", err)
@@ -316,10 +334,17 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	defer demotedConn.Close()
 	demoted := schedulerv1.NewSchedulerClient(demotedConn)
 
-	eventually(t, 30*time.Second, "demoted leader's gate rejects the delayed write", func() (bool, error) {
+	// The gate must flip within the holder-check period (~1s) while the
+	// process is still alive; the force-stop only comes after the renew
+	// deadline (10s), so a restart during this probe means the live window
+	// was missed.
+	eventually(t, 8*time.Second, "live demoted leader's gate rejects the delayed write", func() (bool, error) {
+		if out := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}"); out != "0" {
+			return false, fmt.Errorf("victim restarted before its live gate could be probed")
+		}
 		_, err := demoted.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{
 			SandboxId: "sbx-e2e-t4",
-			Node:      firstDiscoveredNode(t, demoted),
+			Node:      &schedulerv1.Node{NodeId: "node-a"},
 		})
 		if err == nil {
 			return false, fmt.Errorf("demoted leader still accepts writes (dual-leader window open)")
@@ -327,7 +352,13 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 		return strings.Contains(err.Error(), "not the leader"), nil
 	})
 
-	// Meanwhile the new leader serves the same write fine.
+	// The standby takes over once the lease expires.
+	eventually(t, 60*time.Second, "standby takes over", func() (bool, error) {
+		cur := leaderIdentity(t)
+		return cur != "" && cur != victim, nil
+	})
+
+	// The new leader serves the same write fine.
 	forwardLeader(t)
 	client := dial(t)
 	if _, err := client.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{
@@ -336,6 +367,16 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("write through the new leader failed: %v", err)
 	}
+
+	// Past the renew deadline the ex-leader force-stops and restarts as
+	// standby; the cluster converges back to one serving leader.
+	eventually(t, 90*time.Second, "API-blind ex-leader exits (container restarts)", func() (bool, error) {
+		out := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}")
+		return out != "0", nil
+	})
+	eventually(t, 60*time.Second, "still exactly one leader after the ex-leader rejoins", func() (bool, error) {
+		return len(schedulerEndpoints(t)) == 1, nil
+	})
 }
 
 // firstDiscoveredNode resolves a node through the scheduler's own discovery,
