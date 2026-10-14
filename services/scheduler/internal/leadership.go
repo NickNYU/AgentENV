@@ -350,6 +350,25 @@ func (l *leadershipManager) isServingLeader() bool {
 	return s.IsLeader() && s.holderID == l.identity
 }
 
+// watchHolder re-verifies the Lease holder against the API server every
+// second until ctx ends (#341 maintainer review, issue ①). The local
+// acquisition flag alone lags the real holder by up to renew_deadline;
+// cross-checking the holder identity closes the dual-leader window to the
+// refresh cadence. Run must start this loop — without it the gate trusts
+// the local flag forever (found by e2e T4, run 38501272727).
+func (l *leadershipManager) watchHolder(ctx context.Context) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			l.refreshHolderOnce(ctx)
+		}
+	}
+}
+
 // refreshHolderOnce re-reads the Lease from the API server and stores the
 // current holder identity in the state snapshot. Get failures (including a
 // missing Lease) clear the holder, which fails the gate closed — the safe
@@ -406,6 +425,10 @@ func (l *leadershipManager) Run(ctx context.Context, onStop func()) error {
 	if err != nil {
 		return fmt.Errorf("leader election identity failed: %w", err)
 	}
+	// The holder watch and the gate read these; without them the holder
+	// check degrades to a tautology over empty strings (e2e T4).
+	l.clientset = clientset
+	l.identity = hostname
 
 	elector := newLeaderElector(l.logger, l.cfg.LeaderElection,
 		clientset, hostname,
@@ -418,6 +441,7 @@ func (l *leadershipManager) Run(ctx context.Context, onStop func()) error {
 			}
 		},
 	)
+	go l.watchHolder(ctx)
 	return elector.Run(ctx)
 }
 
