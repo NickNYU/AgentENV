@@ -308,7 +308,12 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	t.Logf("isolating leader %s from the API server (%s)", victim, apiIP)
 
 	iptables := func(action string) error {
-		out, err := exec.Command("kubectl", "debug", "-q", victim,
+		// --attach=true is load-bearing: without it kubectl debug returns
+		// once the ephemeral container is CREATED, and the rule only takes
+		// effect when the image finishes pulling and the container runs
+		// (~8s of netshoot pull on a cold node — runs 38498840011,
+		// 38500409403). Attached, the call returns after the rule exists.
+		out, err := exec.Command("kubectl", "debug", "-q", "--attach=true", victim,
 			"--image=nicolaka/netshoot:latest", "--profile=netadmin",
 			"--", "iptables", action, "OUTPUT", "-p", "tcp", "-d", apiIP,
 			"-j", "REJECT", "--reject-with", "tcp-reset").CombinedOutput()
@@ -349,10 +354,10 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	demoted := schedulerv1.NewSchedulerClient(demotedConn)
 
 	// The gate must flip within the holder-check period (~1s) while the
-	// process is still alive; the force-stop only comes after the renew
-	// deadline (10s), so a restart during this probe means the live window
-	// was missed.
-	eventually(t, 8*time.Second, "live demoted leader's gate rejects the delayed write", func() (bool, error) {
+	// process is still alive; the force-stop comes RenewDeadline (10s)
+	// after the last successful renew, so the 6s budget keeps the probe
+	// comfortably inside the live window.
+	eventually(t, 6*time.Second, "live demoted leader's gate rejects the delayed write", func() (bool, error) {
 		if out := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}"); out != restartsAtStart {
 			return false, fmt.Errorf("victim restarted before its live gate could be probed")
 		}
