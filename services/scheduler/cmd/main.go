@@ -43,6 +43,21 @@ func main() {
 	}
 	defer logger.Sync()
 
+	// Startup and lifecycle map (#341 wrap-up):
+	//
+	//  1. Shutdown plumbing: rootCancel + leadershipLossStop. An unexpected
+	//     leadership loss force-stops the process (no dual-writer overlap);
+	//     SIGTERM drains gracefully (bottom of this function).
+	//  2. Store + discovery: the binding store, then the node registry via
+	//     kubernetes discovery or the static node list. With election on
+	//     kubernetes discovery, election waits for the first informer sync.
+	//  3. Service + gate: the gRPC server chains metrics, then the
+	//     leader-only gate; a dedicated leader health service keeps Service
+	//     endpoints to the leader only.
+	//  4. Election: BindRuntime wires the post-acquisition rebuild
+	//     (sync-node-snapshots), then the elector runs — acquisition
+	//     rebuilds observations and bindings, loss drives step 1.
+
 	// rootCancel lets a leadership loss drive the shutdown path as a signal,
 	// but with an important difference (#341 review): on leadership loss the
 	// process force-stops instead of draining, so in-flight writes cannot
@@ -217,25 +232,8 @@ func main() {
 	}
 }
 
-// effectiveBindingTTL floors the binding TTL under leader election (#259,
-// failover safeguard): bindings must outlive the worst-case failover budget
-// (lease detection + endpoints propagation + one reporter reconnect backoff),
-// or live sandboxes would be misreported as NotFound mid-failover. The
-// authoritative cleanup is ReconcileNode; the TTL only guards against a node
-// that crashed for good, so raising it is harmless.
-func effectiveBindingTTL(cfg config.Config) time.Duration {
-	ttl := cfg.Scheduler.BindingTTL
-	if cfg.Scheduler.LeaderElection.Enabled {
-		floor := cfg.Scheduler.LeaderElection.LeaseDuration + 90*time.Second
-		if floor > ttl {
-			ttl = floor
-		}
-	}
-	return ttl
-}
-
 func createBindingStore(logger *zap.Logger, cfg config.Config) (scheduler.BindingStore, func()) {
-	ttl := effectiveBindingTTL(cfg)
+	ttl := cfg.Scheduler.EffectiveBindingTTL()
 	if ttl != cfg.Scheduler.BindingTTL {
 		logger.Info("binding TTL raised to cover the failover budget",
 			zap.Duration("configured", cfg.Scheduler.BindingTTL),
