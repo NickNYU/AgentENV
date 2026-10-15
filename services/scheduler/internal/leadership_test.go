@@ -137,11 +137,9 @@ func TestLeadershipManagerServiceOptionAttachesLeadership(t *testing.T) {
 
 // Leader gate tests (#259, test list group B, unit cases B1-B4).
 
-func invokeGate(t *testing.T, isLeader, serveReads bool, method string) (bool, error) {
+func invokeGate(t *testing.T, isLeader bool, method string) (bool, error) {
 	t.Helper()
-	l := &leadershipManager{
-		sharedBindingStore: serveReads,
-	}
+	l := &leadershipManager{}
 	l.state.Store(newLeadershipSnapshot(30 * time.Second))
 	if isLeader {
 		l.state.Store(acquiredLeadershipSnapshot(30*time.Second, time.Now()))
@@ -156,79 +154,51 @@ func invokeGate(t *testing.T, isLeader, serveReads bool, method string) (bool, e
 	return handlerCalled, err
 }
 
-// Case B1: a standby without a shared store rejects writes.
-func TestGateStandbyWithoutStoreRejectsWrites(t *testing.T) {
-	called, err := invokeGate(t, false, false, "/scheduler.v1.Scheduler/Schedule")
-	if called {
-		t.Fatal("write handler must not run on a standby")
-	}
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("expected Unavailable, got %v", err)
-	}
-	if status.Convert(err).Message() != "not the leader" {
-		t.Fatalf("unexpected message: %v", err)
-	}
-}
-
-// Case B2: a standby without a shared store rejects reads too
-// (degraded mode: reads retry until they land on the leader).
-func TestGateStandbyWithoutStoreRejectsReads(t *testing.T) {
-	called, err := invokeGate(t, false, false, "/scheduler.v1.Scheduler/LookupNode")
-	if called {
-		t.Fatal("read handler must not run on a standby without a shared store")
-	}
-	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("expected Unavailable, got %v", err)
+// Case B1: a standby rejects everything but health checks — the leader-only
+// gate (#341 wrap-up simplification): the shipped topology routes only to
+// the leader, and standby read serving is deferred to a dedicated issue.
+func TestGateStandbyRejectsEverything(t *testing.T) {
+	for _, method := range []string{
+		"/scheduler.v1.Scheduler/Schedule",
+		"/scheduler.v1.Scheduler/LookupNode",
+		"/scheduler.v1.Scheduler/GetNode",
+		"/scheduler.v1.Scheduler/RecordAssignment",
+		"/scheduler.v1.Scheduler/Heartbeat",
+	} {
+		called, err := invokeGate(t, false, method)
+		if called {
+			t.Fatalf("handler for %s must not run on a standby", method)
+		}
+		if status.Code(err) != codes.Unavailable {
+			t.Fatalf("%s: expected Unavailable, got %v", method, err)
+		}
+		if status.Convert(err).Message() != "not the leader" {
+			t.Fatalf("%s: unexpected message: %v", method, err)
+		}
 	}
 }
 
-// Case B3: a standby with a shared Redis store serves reads from it,
-// while writes stay gated.
-func TestGateStandbyWithStoreServesReads(t *testing.T) {
-	called, err := invokeGate(t, false, true, "/scheduler.v1.Scheduler/LookupNode")
-	if !called || err != nil {
-		t.Fatalf("standby with a shared store must serve LookupNode: called=%v err=%v", called, err)
-	}
-
-	// GetNode reads replica-local observations, which are always empty on a
-	// standby — it stays gated even with a shared store (#341 review, F2).
-	called, err = invokeGate(t, false, true, "/scheduler.v1.Scheduler/GetNode")
-	if called || status.Code(err) != codes.Unavailable {
-		t.Fatalf("GetNode must stay gated on standbys (observations are leader-local): called=%v err=%v", called, err)
-	}
-
-	called, err = invokeGate(t, false, true, "/scheduler.v1.Scheduler/RecordAssignment")
-	if called || status.Code(err) != codes.Unavailable {
-		t.Fatalf("writes must stay gated even with a shared store: called=%v err=%v", called, err)
-	}
-
-	called, err = invokeGate(t, false, true, "/scheduler.v1.Scheduler/Heartbeat")
-	if called || status.Code(err) != codes.Unavailable {
-		t.Fatalf("heartbeats must stay gated even with a shared store: called=%v err=%v", called, err)
-	}
-}
-
-// Case B4: health-check RPCs bypass the gate (else probes deadlock).
+// Case B2: health-check RPCs bypass the gate (else probes deadlock).
 func TestGateHealthChecksBypass(t *testing.T) {
 	for _, method := range []string{
 		"/grpc.health.v1.Health/Check",
 		"/grpc.health.v1.Health/Watch",
 	} {
-		called, err := invokeGate(t, false, false, method)
+		called, err := invokeGate(t, false, method)
 		if !called || err != nil {
 			t.Fatalf("health check %s must bypass the gate: called=%v err=%v", method, called, err)
 		}
 	}
 }
 
-// The leader serves everything, including with no shared store.
+// The leader serves everything.
 func TestGateLeaderServesEverything(t *testing.T) {
 	for _, method := range []string{
 		"/scheduler.v1.Scheduler/Schedule",
 		"/scheduler.v1.Scheduler/LookupNode",
 		"/scheduler.v1.Scheduler/Heartbeat",
 	} {
-		called, err := invokeGate(t, true, false, method)
+		called, err := invokeGate(t, true, method)
 		if !called || err != nil {
 			t.Fatalf("leader must serve %s: called=%v err=%v", method, called, err)
 		}

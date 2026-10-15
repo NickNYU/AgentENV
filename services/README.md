@@ -112,7 +112,7 @@ General config notes:
 
 `scheduler.leader_election` enables Kubernetes Lease-based leader election (#259). Off by default; with it off, the scheduler behaves exactly as a single-writer process.
 
-- With it on, N replicas compete for a `coordination.k8s.io/Lease`. Exactly one leader schedules and processes heartbeats; standbys stay liveness-healthy and reject writes with `Unavailable` (standbys may serve reads from the shared Redis bindings at the gate level, but with leader-only endpoints they receive no traffic — see the read gap below).
+- With it on, N replicas compete for a `coordination.k8s.io/Lease`. Exactly one leader schedules and processes heartbeats; standbys stay liveness-healthy and reject everything but health checks with `Unavailable` — the gate is leader-only, matching the leader-only endpoints (see the read gap below).
 - Readiness probes should target the leader-specific health service `scheduler.v1.Scheduler/leader` (`grpc_health_probe -service=scheduler.v1.Scheduler/leader`) so Service endpoints contain only the leader. Liveness keeps probing the overall health status.
 - Traffic rules: node heartbeats → scheduler Service (leader only); gateway writes (`Schedule`, `RecordAssignment`) → same Service; gateway reads (`LookupNode`) → same Service, answered by the leader.
 - On failover, the new leader pulls each node's admin `/nodes` snapshot (sync-node-snapshots) instead of waiting for the next heartbeat; pulls authenticate with the `x-api-key` from `SCHEDULER_NODE_ADMIN_API_KEY` — pass it via env/Secret (the HA overlay mounts the shared `agentenv-auth` Secret), not via config files.
@@ -125,7 +125,7 @@ Because Service endpoints contain only the leader, `LookupNode` is served only b
 
 - With `redis_addr`: bindings survive — under election the binding TTL is floored to `lease_duration + 90s`, deliberately covering the worst-case failover budget (detection + endpoint propagation + one reporter reconnect backoff). Lookups resume automatically and correctly once the new leader is ready; live sandboxes are never misreported as NotFound.
 - Without `redis_addr` (degraded mode): bindings die with the old leader's process, so lookups for pre-failover sandboxes keep failing after the gap until those sandboxes are recreated. New scheduling is unaffected.
-- Closing the gap entirely (standbys serving reads) is an open design fork under review in #341; this section describes the shipped behavior.
+- Closing the gap entirely (standbys serving reads) is deferred to a dedicated follow-up issue; this section describes the shipped behavior.
 
 `scheduler.strategy` selects the algorithm used to pick a node from the eligible candidate list. Built-in strategies:
 
