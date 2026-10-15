@@ -99,6 +99,22 @@ type SchedulerConfig struct {
 	LeaderElection          SchedulerLeaderElectionConfig `json:"leader_election"`
 }
 
+// EffectiveBindingTTL floors the binding TTL under leader election (#259,
+// failover safeguard): bindings must outlive the worst-case failover budget
+// (lease detection + endpoints propagation + one reporter reconnect
+// backoff), or live sandboxes would be misreported as NotFound mid-failover.
+// The authoritative cleanup is ReconcileNode; the TTL only guards against a
+// node that crashed for good, so raising it is harmless.
+func (s SchedulerConfig) EffectiveBindingTTL() time.Duration {
+	ttl := s.BindingTTL
+	if s.LeaderElection.Enabled {
+		if floor := s.LeaderElection.LeaseDuration + 90*time.Second; floor > ttl {
+			ttl = floor
+		}
+	}
+	return ttl
+}
+
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	type wire struct {
 		GRPCListenAddr          *string                   `json:"grpc_listen_addr"`
