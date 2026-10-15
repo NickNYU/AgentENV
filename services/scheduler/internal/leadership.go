@@ -204,15 +204,14 @@ var LeaderHealthService = schedulerv1.Scheduler_ServiceDesc.ServiceName + "/lead
 //	NewLeadershipManager → ServiceOption / GateInterceptor → (build Service)
 //	→ BindRuntime → RegisterHealth → Run
 type leadershipManager struct {
-	logger             *zap.Logger
-	cfg                config.SchedulerConfig
-	state              atomic.Pointer[leadershipSnapshot]
-	sharedBindingStore bool
-	health             *health.Server
-	svc                *Service
-	registry           NodeRegistry
-	identity           string
-	clientset          kubernetes.Interface
+	logger    *zap.Logger
+	cfg       config.SchedulerConfig
+	state     atomic.Pointer[leadershipSnapshot]
+	health    *health.Server
+	svc       *Service
+	registry  NodeRegistry
+	identity  string
+	clientset kubernetes.Interface
 }
 
 // NewLeadershipManager builds the manager and its Leadership state. It must
@@ -225,9 +224,6 @@ func newLeadershipManager(logger *zap.Logger, cfg config.SchedulerConfig) *leade
 	l := &leadershipManager{
 		logger: logger,
 		cfg:    cfg,
-		// Whether standbys may serve reads depends on the binding store:
-		// shared (Redis) → reads served; in-memory → reads rejected too.
-		sharedBindingStore: strings.TrimSpace(cfg.RedisAddr) != "",
 	}
 	l.state.Store(newLeadershipSnapshot(cfg.ReportTTL))
 	logger.Info("scheduler leader election enabled",
@@ -262,56 +258,19 @@ func (l *leadershipManager) RecoveryPending(nodeID string, lastReportAt *time.Ti
 	return l.state.Load().RecoveryPending(nodeID, lastReportAt)
 }
 
-// standbyReadableMethods classifies every Scheduler RPC: true = a non-leader
-// replica sharing the binding store (Redis) may serve it; false = gated
-// behind leadership. The table lists all methods explicitly so a proto
-// change adding an RPC cannot silently fall into "not a read, reject":
-// init panics on any unclassified method (fail fast at startup, #259).
-//
-// Notes on the reads:
-//   - LookupNode reads bindings from the shared store: correct on standbys.
-//   - GetNode reads replica-local observations, which are always empty on
-//     standbys (heartbeats/pulls only reach the leader), so serving it there
-//     would return a terminal NotFound for real nodes. Gated (#341 review).
-//   - ListNodes reads the informer-backed registry (warm on every replica)
-//     and is semantically standby-serveable, but stays gated for now —
-//     deferred to a PR decision (#259 review).
-var standbyReadableMethods = map[string]bool{
-	"/scheduler.v1.Scheduler/Schedule":           false,
-	"/scheduler.v1.Scheduler/ListNodes":          false,
-	"/scheduler.v1.Scheduler/LookupNode":         true,
-	"/scheduler.v1.Scheduler/RecordAssignment":   false,
-	"/scheduler.v1.Scheduler/Heartbeat":          false,
-	"/scheduler.v1.Scheduler/ReportSandboxEvent": false,
-	"/scheduler.v1.Scheduler/ListObservedNodes":  false,
-	"/scheduler.v1.Scheduler/ListP2pPeers":       false,
-	"/scheduler.v1.Scheduler/RecordP2pArtifact":  false,
-	"/scheduler.v1.Scheduler/ForgetP2pArtifact":  false,
-	"/scheduler.v1.Scheduler/LookupP2pArtifact":  false,
-	"/scheduler.v1.Scheduler/GetNode":            false,
-	"/scheduler.v1.Scheduler/UnregisterNode":     false,
-}
-
-func init() {
-	serviceName := schedulerv1.Scheduler_ServiceDesc.ServiceName
-	for _, method := range schedulerv1.Scheduler_ServiceDesc.Methods {
-		fullMethod := "/" + serviceName + "/" + method.MethodName
-		if _, ok := standbyReadableMethods[fullMethod]; !ok {
-			panic("scheduler: unclassified RPC in standbyReadableMethods: " + fullMethod)
-		}
-	}
-}
-
-// GateInterceptor returns the read/write gate to chain into the gRPC server
+// GateInterceptor returns the leader gate to chain into the gRPC server
 // after the metrics interceptor. gRPC registration must happen before
 // Serve, so gating is an interceptor, not late registration. Behaviour:
 //
 //   - health-check RPCs are never gated (liveness must work on standbys);
 //   - the leader serves everything;
-//   - a standby with a shared binding store serves the read RPCs above from
-//     that store and rejects the rest with Unavailable("not the leader");
-//   - a standby without a shared store (in-memory bindings) rejects reads
-//     too, and lookups reach the leader via client retry (degraded mode).
+//   - a standby rejects everything else with Unavailable("not the leader").
+//
+// The shipped topology is leader-only: the readiness probe keeps standbys
+// out of the Service endpoints, and existing-sandbox lookups during a
+// failover ride the query-only replicas / the floored binding TTL (#341
+// review, R4). Serving reads on standbys is deferred to a dedicated issue
+// (#341 wrap-up simplification).
 //
 // When leader election is disabled the factory returns nonLeadership, whose
 // interceptor is a pass-through; this manager only runs with election on.
@@ -321,9 +280,6 @@ func (l *leadershipManager) GateInterceptor() grpc.UnaryServerInterceptor {
 			return handler(ctx, req)
 		}
 		if l.isServingLeader() {
-			return handler(ctx, req)
-		}
-		if l.sharedBindingStore && standbyReadableMethods[info.FullMethod] {
 			return handler(ctx, req)
 		}
 		return nil, status.Error(codes.Unavailable, "not the leader")
