@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -105,5 +106,87 @@ func TestFreshPullStillIngestsAndReconciles(t *testing.T) {
 	}
 	if _, found, _ := store.Get("sbx-old", base.Add(3*time.Second)); found {
 		t.Fatal("fresh pull must reconcile its roster: sbx-old binding should be gone")
+	}
+}
+
+// guozy18's wrap-up (#341): an accepted pull that already landed in the
+// registry can still lose its roster reconcile to a newer heartbeat — the
+// heartbeat updates Redis, then the pull's older roster reconcile deletes
+// the heartbeat's bindings (brief routing drops). Report ingestion and
+// binding reconciliation must be ordered per node. The hook parks the pull
+// between registry ingest and reconcile, forcing the exact interleave.
+func TestPullReconcileCannotOvertakeNewerHeartbeat(t *testing.T) {
+	base := time.UnixMilli(1_760_000_000_000)
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL)
+	store := NewInMemoryBindingStore(defaultObservedReportTTL)
+	service := NewService(zap.NewNop(), registry, NewStrategy("round_robin"), store)
+
+	// Seed the node so the pull is a rebuild, not a first report.
+	seed := nodeReportFromProto(&schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ServiceInstanceId: "svc-1",
+		SandboxIds:        []string{"sbx-old"},
+		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY, SandboxCount: 1},
+	})
+	if _, err := service.ingestNodeReport(seed, base); err != nil {
+		t.Fatalf("seed heartbeat: %v", err)
+	}
+
+	// Park the FIRST ingest (the pull) between registry update and
+	// reconcile. The gate must be a non-blocking CAS, not a sync.Once: a
+	// second Once.Do blocks while the first closure runs, which would park
+	// the heartbeat behind the pull and mimic the very ordering under test.
+	pullParked := make(chan struct{})
+	releasePull := make(chan struct{})
+	var hookArmed atomic.Bool
+	hookArmed.Store(true)
+	service.beforeReconcile = func() {
+		if hookArmed.CompareAndSwap(true, false) {
+			close(pullParked)
+			<-releasePull
+		}
+	}
+
+	// The pull captured an empty roster at T2 (sbx-new did not exist yet)
+	// and passes the freshness check.
+	pull := &nodeReport{
+		nodeID:            "node-a",
+		serviceInstanceID: "svc-1",
+		fetchedAt:         base.Add(time.Second),
+		sandboxIDs:        []string{},
+		snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY, SandboxCount: 0},
+	}
+	pullDone := make(chan error, 1)
+	go func() {
+		_, err := service.ingestNodeReport(pull, base.Add(2*time.Second))
+		pullDone <- err
+	}()
+	<-pullParked
+
+	// The heartbeat races in at T3 carrying both sandboxes.
+	heartbeat := nodeReportFromProto(&schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ServiceInstanceId: "svc-1",
+		SandboxIds:        []string{"sbx-old", "sbx-new"},
+		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY, SandboxCount: 2},
+	})
+	hbDone := make(chan error, 1)
+	go func() {
+		_, err := service.ingestNodeReport(heartbeat, base.Add(3*time.Second))
+		hbDone <- err
+	}()
+	// Without per-node ordering the heartbeat completes while the pull is
+	// parked; with it, the heartbeat waits for the pull's section to end.
+	time.Sleep(100 * time.Millisecond)
+	close(releasePull)
+	if err := <-pullDone; err != nil {
+		t.Fatalf("pull ingest: %v", err)
+	}
+	if err := <-hbDone; err != nil {
+		t.Fatalf("heartbeat ingest: %v", err)
+	}
+
+	if _, found, _ := store.Get("sbx-new", base.Add(4*time.Second)); !found {
+		t.Fatal("stale pull reconcile deleted a binding the newer heartbeat affirmed")
 	}
 }
