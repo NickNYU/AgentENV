@@ -16,7 +16,6 @@ type NodeRegistry interface {
 	Snapshot(allowLingering bool) []Node
 	Contains(node Node) bool
 	Resolve(nodeID string) (Node, bool)
-	Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error)
 	// IngestPulled applies a pulled observation only when it was captured no
 	// earlier than the node's latest report: check and update are one locked
 	// step, so a heartbeat landing mid-ingest always wins. applied is false
