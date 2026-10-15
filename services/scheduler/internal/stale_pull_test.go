@@ -176,14 +176,27 @@ func TestPullReconcileCannotOvertakeNewerHeartbeat(t *testing.T) {
 		hbDone <- err
 	}()
 	// Without per-node ordering the heartbeat completes while the pull is
-	// parked; with it, the heartbeat waits for the pull's section to end.
-	time.Sleep(100 * time.Millisecond)
+	// parked; wait for that explicitly so releasing the pull deterministically
+	// lands its stale roster after the heartbeat's Redis update. With
+	// ordering, the heartbeat still waits for the pull's section when the
+	// probe times out, and the release lets both run in order.
+	hbFinished := false
+	select {
+	case err := <-hbDone:
+		hbFinished = true
+		if err != nil {
+			t.Fatalf("heartbeat ingest: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+	}
 	close(releasePull)
 	if err := <-pullDone; err != nil {
 		t.Fatalf("pull ingest: %v", err)
 	}
-	if err := <-hbDone; err != nil {
-		t.Fatalf("heartbeat ingest: %v", err)
+	if !hbFinished {
+		if err := <-hbDone; err != nil {
+			t.Fatalf("heartbeat ingest: %v", err)
+		}
 	}
 
 	if _, found, _ := store.Get("sbx-new", base.Add(4*time.Second)); !found {
