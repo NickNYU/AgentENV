@@ -30,6 +30,14 @@ type Service struct {
 	artifacts     ArtifactStore
 	resourceLimit *config.NodeResourceLimit
 	leadership    leadershipView
+	// TODO(#341, B1 — author review): yingdi-shan proposes pulls refresh
+	// observations only and never reconcile bindings (Redis holds bindings
+	// under the floored TTL; heartbeats reconcile within one reporter
+	// cycle). The binding race the stripes close then cannot happen by
+	// construction, and the stripes, the beforeReconcile seam and the
+	// nil-vs-empty roster tri-state all go — as does the admin /nodes
+	// sandboxIDs addition on the Rust side.
+	//
 	// ingestStripes serializes report ingestion per node (#341 wrap-up):
 	// the registry update and the binding reconcile must be one ordered
 	// section, or a slower pull's roster can delete bindings a newer
@@ -158,6 +166,12 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	return &schedulerv1.ScheduleResponse{Node: node.Node.ToProto()}, nil
 }
 
+// TODO(#341, B2 — author review): with observations post-acquisition by
+// construction (see the leadershipSnapshot TODO), this filter reduces to
+// "known at acquisition && PeekObserved(id) == nil"; the LastReportAt
+// comparisons and millisecond handling go (yingdi-shan). Check
+// PeekObserved's TTL-expiry behavior when doing this.
+//
 // filterFreshObservations applies the fresh-observations-only rule (#259):
 // a node that was known at leadership acquisition is a scheduling candidate
 // only once it has reported at or after the acquisition — a timer alone
@@ -360,6 +374,10 @@ func (s *Service) ingestNodeReport(report *nodeReport, now time.Time) (*schedule
 		// Heartbeat: the request is the capture, so it is always fresh.
 		capturedAt = now
 	} else if req.P2PEndpoint == nil {
+		// TODO(#341, B3 — author review): admin /nodes returns p2pEndpoint
+		// now, so this carry-over and NodeRegistry.P2PEndpointFor can go
+		// (yingdi-shan).
+		//
 		// The admin API does not serve the P2P endpoint; carry over the
 		// previously known one so a pull does not erase it (#341 review).
 		req.P2PEndpoint = s.nodes.P2PEndpointFor(report.nodeID)

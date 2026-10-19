@@ -1,5 +1,10 @@
 package main
 
+// TODO(#341, B6 — author review): this helper and its test can be a
+// nil-able chan struct{} in main (if wait { ready = make(chan struct{}) });
+// discovery would take `ready chan<- struct{}` and nil-check before close,
+// instead of a variadic used as one optional channel (yingdi-shan).
+//
 // discoveryReadyFor returns the ready-channel wiring for kubernetes
 // discovery. A channel exists only when startup waits for the first sync
 // (leader election on kubernetes discovery): discovery closes it once its

@@ -283,6 +283,12 @@ func TestTakeoverSchedulingSemantics(t *testing.T) {
 	})
 }
 
+// TODO(#341, A1 — author review): if the holder watch is removed
+// (leadership.go), re-scope this test to the timing invariant: the
+// API-blind ex-leader stops serving and exits within renew_deadline, and
+// the standby acquires only after the Lease expires — no overlap — instead
+// of probing the live gate's fail-closed flip.
+//
 // T4 (guozy's R3 delayed-write case, yingdi-shan's review ⑤): a
 // demoted-but-ALIVE leader must stop serving. Cut the leader off from the
 // API server (iptables REJECT from an ephemeral netadmin container — Kind's

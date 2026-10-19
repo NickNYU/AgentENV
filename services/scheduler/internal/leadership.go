@@ -142,6 +142,13 @@ func acquiredLeadershipSnapshot(recoveryTTL time.Duration, now time.Time, knownN
 	return &leadershipSnapshot{leader: true, since: now, recoveryTTL: recoveryTTL, knownNodes: known}
 }
 
+// TODO(#341, B2 — author review): yingdi-shan observes that a process
+// acquires leadership at most once (it exits on loss) and standbys ingest
+// nothing, so every observation on the leader is post-acquisition by
+// construction. The recovery rule then shrinks to "known at acquisition &&
+// PeekObserved(id) == nil", and LeaderSince / LastReportAt / the
+// millisecond-precision handling / this timestamp parameter can go.
+//
 // RecoveryPending reports whether nodeID was known at acquisition and has
 // not yet produced a post-acquisition report (lastReportAt is the node's
 // latest report time, ok=false when it never reported).
@@ -304,6 +311,15 @@ func (l *leadershipManager) isServingLeader() bool {
 	return s.IsLeader() && s.holderID == l.identity
 }
 
+// TODO(#341, A1 — author review): yingdi-shan proposes removing this watch
+// entirely: with renew_deadline < lease_duration, client-go stops the old
+// leader before the standby can acquire, so the dual-leader window it
+// closes cannot occur; the inequality would be enforced in config
+// validation, and e2e T4 re-scoped to the timing invariant. If kept
+// instead: fix the lost update in refreshHolderOnce (below), move the
+// holder flag to a dedicated atomic, and start the loop from
+// onStartedLeading so standbys don't run it.
+//
 // watchHolder re-verifies the Lease holder against the API server every
 // second until ctx ends (#341 maintainer review, issue ①). The local
 // acquisition flag alone lags the real holder by up to renew_deadline;
@@ -323,6 +339,12 @@ func (l *leadershipManager) watchHolder(ctx context.Context) {
 	}
 }
 
+// TODO(#341, A1): known lost update — if onStartedLeading stores the
+// acquired snapshot between the Load and Store below, this copy overwrites
+// it with leader:false and the replica locks itself out while holding the
+// Lease (yingdi-shan). See the watchHolder TODO for the keep-or-remove
+// decision.
+//
 // refreshHolderOnce re-reads the Lease from the API server and stores the
 // current holder identity in the state snapshot. Get failures (including a
 // missing Lease) clear the holder, which fails the gate closed — the safe
@@ -353,6 +375,11 @@ func (l *leadershipManager) MarkNotServing() {
 	}
 }
 
+// TODO(#341, B5 — author review): pass svc/registry as Run arguments
+// instead, removing this two-phase init, the nil guards in
+// onStartedLeading and the "run before BindRuntime" error path
+// (yingdi-shan).
+//
 // BindRuntime attaches the service-side dependencies needed by the
 // sync-node-snapshots retrieval on acquire. Must be called after Service
 // construction and before Run. The registry is the NodeRegistry interface:

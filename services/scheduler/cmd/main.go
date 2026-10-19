@@ -196,6 +196,12 @@ func main() {
 	leadership.MarkNotServing()
 
 	if leadershipLost.Load() {
+		// TODO(#341, A3 — author review): known residual — g.Stop() closes
+		// transports, but handlers already running (RecordAssignment,
+		// Heartbeat, pull ingestion) can still commit Redis writes after
+		// takeover; there is no store-level fencing token. Accept and
+		// document, or file a follow-up (yingdi-shan).
+		//
 		// Leadership loss: stop immediately. In-flight RPCs fail and clients
 		// retry onto the new leader — better than a dual-writer overlap
 		// (#341 review).

@@ -16,6 +16,9 @@ type NodeRegistry interface {
 	Snapshot(allowLingering bool) []Node
 	Contains(node Node) bool
 	Resolve(nodeID string) (Node, bool)
+	// TODO(#341, B3 — author review): heartbeats use this too now, so
+	// "Ingest" would be the clearer name (yingdi-shan).
+	//
 	// IngestPulled applies a pulled observation only when it was captured no
 	// earlier than the node's latest report: check and update are one locked
 	// step, so a heartbeat landing mid-ingest always wins. applied is false
@@ -36,11 +39,18 @@ type NodeRegistry interface {
 	// and returns only the raw snapshot suitable for scheduling decisions.
 	// Returns nil if the node has never sent a heartbeat.
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	// TODO(#341, B2 — author review): with observations post-acquisition by
+	// construction, this interface method isn't needed; the full-precision
+	// lastReportAt stays private for the pull freshness check (yingdi-shan).
+	//
 	// LastReportAt returns when the given node last reported (heartbeat or
 	// pulled snapshot). The second return value is false if the node has
 	// never reported. Used by the leader-election recovery window to tell
 	// fresh observations from pre-acquisition ones (#259).
 	LastReportAt(nodeID string) (time.Time, bool)
+	// TODO(#341, B3 — author review): admin /nodes returns p2pEndpoint now,
+	// so this carry-over lookup can go (yingdi-shan).
+	//
 	// P2PEndpointFor returns the node's last reported P2P endpoint, or nil.
 	// Read-only lookup used by the snapshot-pull path, whose admin source
 	// cannot provide the endpoint (#341 review).

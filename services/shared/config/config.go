@@ -533,6 +533,10 @@ func (c Config) Validate() error {
 	return c.validate(false)
 }
 
+// TODO(#341, A1 — author review): if the holder watch is removed (see
+// leadership.go), validate renew_deadline < lease_duration when election is
+// on — client-go then stops the old leader before the standby can acquire,
+// which is the invariant the no-dual-leader argument rests on (yingdi-shan).
 func (c Config) validate(schedulerQueryOnly bool) error {
 	if c.Service == "" {
 		return errors.New("service is required")

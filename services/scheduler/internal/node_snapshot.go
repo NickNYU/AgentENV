@@ -17,6 +17,13 @@ import (
 
 // ============================================================
 
+// TODO(#341, B4 — author review): this interface,
+// ConcurrentNodeSnapshotRefresher, NodeSnapshotFetcher and
+// nodeReportIngester all exist for a single call site; yingdi-shan
+// proposes one pullNodeSnapshots(ctx, logger, nodes, fetch, ingest,
+// concurrency) function. The concurrency default of 4 is also duplicated
+// here and in config.applyDefaults.
+//
 // nodeSnapshotRefresher is this file's contract: refresh the leader's
 // observations and bindings for a set of nodes by pulling their admin
 // snapshots (sync-node-snapshots, #259). The only production implementation
@@ -26,6 +33,12 @@ type nodeSnapshotRefresher interface {
 	Refresh(ctx context.Context, nodes []Node)
 }
 
+// TODO(#341, B3 — author review): nodeReport makes a proto -> struct ->
+// proto round trip on every heartbeat (nodeReportFromProto then
+// toHeartbeatRequest); yingdi-shan proposes the fetcher return
+// *schedulerv1.HeartbeatRequest plus fetchedAt instead. With B1
+// (observations-only pulls) the sandboxIDs tri-state goes too.
+//
 // nodeReport is the neutral currency of node-state ingestion (#259): what a
 // fetcher returns after successfully pulling a node, and what the shared
 // ingest path consumes. Both the Heartbeat RPC handler and
@@ -278,6 +291,10 @@ func adminGetJSON(ctx context.Context, client *http.Client, apiKey, url string, 
 }
 
 func reportFromAdmin(n *adminNodeResponse, fetchedAt time.Time) *nodeReport {
+	// TODO(#341, B1 — author review): with observations-only pulls this
+	// roster decoding goes, and the Rust admin /nodes sandboxIDs addition
+	// with it (cpuConfigJSON and p2pEndpoint stay).
+	//
 	// The admin roster is authoritative when present (same source as
 	// heartbeat sandbox_ids: orchestrator.list_sandbox_ids), so a parity
 	// pull may reconcile bindings; an absent roster stays nil and skips
