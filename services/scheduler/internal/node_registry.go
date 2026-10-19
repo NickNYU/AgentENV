@@ -22,7 +22,11 @@ type NodeRegistry interface {
 	// when the pull was stale and nothing was ingested (#341 review,
 	// guozy18). The wire timestamp stays millisecond-truncated; freshness is
 	// arbitrated on a full-precision ingest time kept alongside the record.
-	IngestPulled(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time) (node Node, cpuConfigJSON string, applied bool, err error)
+	// deliverIntersection must be false for pulls: their response is
+	// discarded, so marking the one-shot CPU intersection as delivered
+	// would starve the node's next real heartbeat (#341 review,
+	// yingdi-shan).
+	IngestPulled(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time, deliverIntersection bool) (node Node, cpuConfigJSON string, applied bool, err error)
 	ListObserved(clusterID string, now time.Time) []*schedulerv1.ObservedNode
 	ListP2pPeers(clusterID string, backend string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	FilterP2pPeers(clusterID string, backend string, nodeIDs []string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
@@ -160,10 +164,10 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.heartbeatLocked(req, now)
+	return r.heartbeatLocked(req, now, true)
 }
 
-func (r *AtomicNodeRegistry) IngestPulled(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time) (Node, string, bool, error) {
+func (r *AtomicNodeRegistry) IngestPulled(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time, deliverIntersection bool) (Node, string, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if rec, ok := r.observed[req.GetNodeId()]; ok && rec.lastReportAt.After(fetchedAt) {
@@ -172,14 +176,14 @@ func (r *AtomicNodeRegistry) IngestPulled(req *schedulerv1.HeartbeatRequest, fet
 		// skip the roster reconcile too.
 		return Node{}, "", false, nil
 	}
-	node, cpuConfigJSON, err := r.heartbeatLocked(req, now)
+	node, cpuConfigJSON, err := r.heartbeatLocked(req, now, deliverIntersection)
 	if err != nil {
 		return Node{}, "", false, err
 	}
 	return node, cpuConfigJSON, true, nil
 }
 
-func (r *AtomicNodeRegistry) heartbeatLocked(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error) {
+func (r *AtomicNodeRegistry) heartbeatLocked(req *schedulerv1.HeartbeatRequest, now time.Time, deliverIntersection bool) (Node, string, error) {
 	nowMs := now.UTC().UnixMilli()
 
 	machineInfo := cloneMachineInfo(req.GetMachineInfo())
@@ -236,8 +240,13 @@ func (r *AtomicNodeRegistry) heartbeatLocked(req *schedulerv1.HeartbeatRequest, 
 	}
 
 	if intersection, ok := r.cpuIntersection[clusterID]; ok && !r.intersectionSent[req.GetNodeId()] {
-		r.intersectionSent[req.GetNodeId()] = true
-		return node, intersection, nil
+		// A discarded response must not count as delivered: pulls leave the
+		// one-shot intersection pending for the node's next real heartbeat
+		// (#341 review, yingdi-shan).
+		if deliverIntersection {
+			r.intersectionSent[req.GetNodeId()] = true
+			return node, intersection, nil
+		}
 	}
 	return node, "", nil
 }
