@@ -487,3 +487,44 @@ func TestMultiClusterCpuIntersectionsAreIndependent(t *testing.T) {
 		t.Errorf("cluster-y y1: got unexpected second delivery %v", c)
 	}
 }
+
+// yingdi-shan's review (#341): a snapshot pull must not consume the
+// one-shot CPU intersection. The pull's response is discarded by the
+// caller, so a node marked as sent at pull time would never receive the
+// intersection on its next real heartbeat.
+func TestPullIngestDoesNotConsumeCpuIntersection(t *testing.T) {
+	cfg := buildConfig(nil, []cpuidModifier{{
+		Leaf: "0x1", Subleaf: "0x0", Flags: 0,
+		Modifiers: []registerMod{{Register: "eax", Bitmap: bm32(0xFF)}},
+	}}, nil)
+
+	registry := NewAtomicNodeRegistry([]Node{
+		{ID: "node-a", Endpoint: "http://node-a"},
+		{ID: "node-b", Endpoint: "http://node-b"},
+	}, 30*time.Second)
+
+	// node-a reports: the intersection is not computable until node-b is
+	// observed with a config.
+	if got := heartbeatWithConfig(t, registry, "node-a", "cluster-1", "svc-a", cfg); got != "" {
+		t.Fatal("before node-b is observed, expected empty intersection, got non-empty")
+	}
+
+	// A rebuild pull ingests node-b's data (including its CPU config). The
+	// intersection becomes computable here — and the discarded pull
+	// response must not count as delivered.
+	pulled := &schedulerv1.HeartbeatRequest{
+		NodeId:            "node-b",
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: "svc-b",
+		MachineInfo:       &schedulerv1.MachineInfo{CpuConfigJson: cfg},
+	}
+	now := time.Unix(200, 0)
+	if _, _, applied, err := registry.IngestPulled(pulled, now.Add(-time.Second), now); err != nil || !applied {
+		t.Fatalf("pull ingest: applied=%v err=%v", applied, err)
+	}
+
+	// node-b's next real heartbeat must still deliver the intersection.
+	if got := heartbeatWithConfig(t, registry, "node-b", "cluster-1", "svc-b", cfg); got == "" {
+		t.Fatal("pull consumed the one-shot CPU intersection; node-b never receives it")
+	}
+}
