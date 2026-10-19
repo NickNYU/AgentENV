@@ -31,8 +31,6 @@ type leadershipView interface {
 	InRecoveryWindow(now time.Time) bool
 	LeaderSince() (time.Time, bool)
 	// RecoveryPending reports whether nodeID was known at acquisition and
-	// has not yet produced a post-acquisition report.
-	// RecoveryPending reports whether nodeID was known at acquisition and
 	// has not yet produced a post-acquisition report. A nil lastReportAt
 	// means the node never reported.
 	RecoveryPending(nodeID string, lastReportAt *time.Time) bool
@@ -274,8 +272,8 @@ func (l *leadershipManager) RecoveryPending(nodeID string, lastReportAt *time.Ti
 // review, R4). Serving reads on standbys is deferred to a dedicated issue
 // (#341 wrap-up simplification).
 //
-// When leader election is disabled the lifecycle (and this interceptor) is
-// not installed at all.
+// When leader election is disabled the factory returns nonLeadership, whose
+// interceptor is a pass-through; this manager only runs with election on.
 func (l *leadershipManager) GateInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if strings.HasPrefix(info.FullMethod, "/grpc.health.v1.") {

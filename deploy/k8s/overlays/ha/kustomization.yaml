@@ -4,11 +4,11 @@ kind: Kustomization
 # HA scheduler topology (#259): 3 leader-elected scheduler replicas behind
 # one Service. Only the leader is ready (readiness probes the leader-specific
 # health service), so Service endpoints contain only the leader; standbys
-# stay liveness-healthy and serve reads from the shared Redis bindings.
+# stay liveness-healthy and reject everything but health checks.
 #
-# Point scheduler.redis_addr at your Redis to enable standby reads and
-# failover-preserved routing; without it the scheduler runs the documented
-# degraded mode (reads retry to the leader; pre-failover routing is lost).
+# Point scheduler.redis_addr at your Redis for failover-preserved routing
+# (bindings outlive the leader swap under the floored TTL); without it the
+# scheduler runs the documented degraded mode (pre-failover routing is lost).
 
 resources:
   - ../../base
