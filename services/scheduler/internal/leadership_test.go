@@ -305,12 +305,33 @@ func TestElectionFailoverAfterCancel(t *testing.T) {
 	})
 }
 
+// leasePartitionReactor fails Lease updates from the armed holder,
+// simulating an API partition. Register it BEFORE the elector starts —
+// PrependReactor mutates the fake's reactor chain while the elector
+// goroutine reads it (go test -race); arming later is race-free via the
+// atomics.
+func leasePartitionReactor(leaderID *atomic.Value, armed *atomic.Bool) func(ktesting.Action) (bool, runtime.Object, error) {
+	return func(action ktesting.Action) (bool, runtime.Object, error) {
+		if !armed.Load() {
+			return false, nil, nil
+		}
+		lease, ok := action.(ktesting.UpdateAction).GetObject().(*coordinationv1.Lease)
+		if !ok || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != leaderID.Load().(string) {
+			return false, nil, nil
+		}
+		return true, nil, errors.New("apiserver unreachable (simulated partition)")
+	}
+}
+
 // Case C3: fencing under renewal failure — when the leader can no longer
 // renew the Lease (partition equivalent), it must call OnStoppedLeading
 // within renew_deadline and the standby must take over. No dual-primary
 // window: the standby only starts after the Lease actually expires.
 func TestElectionFencingOnRenewFailure(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
+	var leaderID atomic.Value
+	var partitionArmed atomic.Bool
+	clientset.PrependReactor("update", "leases", leasePartitionReactor(&leaderID, &partitionArmed))
 	a := startRunner(t, clientset, "replica-a")
 	b := startRunner(t, clientset, "replica-b")
 
@@ -319,20 +340,15 @@ func TestElectionFencingOnRenewFailure(t *testing.T) {
 	})
 
 	leader, standby := a, b
-	leaderID := "replica-a"
+	id := "replica-a"
 	if b.state.Load().IsLeader() {
 		leader, standby = b, a
-		leaderID = "replica-b"
+		id = "replica-b"
 	}
 
 	// Simulate a partition: Lease updates by the current holder now fail.
-	clientset.PrependReactor("update", "leases", func(action ktesting.Action) (bool, runtime.Object, error) {
-		lease, ok := action.(ktesting.UpdateAction).GetObject().(*coordinationv1.Lease)
-		if !ok || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != leaderID {
-			return false, nil, nil
-		}
-		return true, nil, errors.New("apiserver unreachable (simulated partition)")
-	})
+	leaderID.Store(id)
+	partitionArmed.Store(true)
 
 	eventually(t, 5*time.Second, "ex-leader stops serving within renew_deadline", func() bool {
 		return leader.stopped.Load() >= 1 && !leader.state.Load().IsLeader()
@@ -359,6 +375,9 @@ func TestElectionCallbackOrderNoDualPrimary(t *testing.T) {
 	}
 
 	clientset := fake.NewSimpleClientset()
+	var leaderID atomic.Value
+	var partitionArmed atomic.Bool
+	clientset.PrependReactor("update", "leases", leasePartitionReactor(&leaderID, &partitionArmed))
 	start := func(id string) *atomic.Pointer[leadershipSnapshot] {
 		state := &atomic.Pointer[leadershipSnapshot]{}
 		state.Store(newLeadershipSnapshot(30 * time.Second))
@@ -399,21 +418,14 @@ func TestElectionCallbackOrderNoDualPrimary(t *testing.T) {
 	}
 	mu.Unlock()
 
-	// Kill the leader (cancel via cleanup happens later; simulate loss by
-	// renewing failure is C3's job — here we only assert ordering of the
-	// events seen so far and after a forced loss).
-	// Force a loss: prepend the same renew-failure reactor as C3.
-	leaderID := "replica-a"
+	// Force a loss with the same renew-failure partition as C3 (reactor
+	// registered above, armed here — race-free).
+	id := "replica-a"
 	if b.Load().IsLeader() {
-		leaderID = "replica-b"
+		id = "replica-b"
 	}
-	clientset.PrependReactor("update", "leases", func(action ktesting.Action) (bool, runtime.Object, error) {
-		lease, ok := action.(ktesting.UpdateAction).GetObject().(*coordinationv1.Lease)
-		if !ok || lease.Spec.HolderIdentity == nil || *lease.Spec.HolderIdentity != leaderID {
-			return false, nil, nil
-		}
-		return true, nil, errors.New("apiserver unreachable (simulated partition)")
-	})
+	leaderID.Store(id)
+	partitionArmed.Store(true)
 
 	eventually(t, 5*time.Second, "stop then takeover ordering", func() bool {
 		mu.Lock()

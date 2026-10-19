@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -159,9 +160,9 @@ func TestPullFailureKeepsNodeUnobserved(t *testing.T) {
 	t0 := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	svc, registry, _ := newLeaderTestService(t, []string{"node-a", "node-b"}, 30*time.Second, t0.Add(2*time.Second), t0)
 
-	fetchCalls := 0
+	var fetchCalls atomic.Int32
 	fetch := func(_ context.Context, node Node) (*nodeReport, error) {
-		fetchCalls++
+		fetchCalls.Add(1)
 		if node.ID == "node-b" {
 			return nil, errors.New("admin endpoint unreachable")
 		}
@@ -174,8 +175,8 @@ func TestPullFailureKeepsNodeUnobserved(t *testing.T) {
 	refresher := NewConcurrentNodeSnapshotRefresher(nil, ingest, fetch, 2)
 	refresher.Refresh(context.Background(), registry.Snapshot(false))
 
-	if fetchCalls != 2 {
-		t.Fatalf("rebuild must pull every node exactly once; got %d fetches for 2 nodes", fetchCalls)
+	if fetchCalls.Load() != 2 {
+		t.Fatalf("rebuild must pull every node exactly once; got %d fetches for 2 nodes", fetchCalls.Load())
 	}
 	if _, ok := registry.LastReportAt("node-a"); !ok {
 		t.Fatal("a successful pull must observe node-a")
