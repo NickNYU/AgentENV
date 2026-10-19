@@ -369,7 +369,10 @@ func (s *Service) ingestNodeReport(report *nodeReport, now time.Time) (*schedule
 	// heartbeat landing mid-ingest always wins (#341 review, guozy18). A
 	// skipped pull must not reconcile either: its roster is just as stale
 	// and would delete bindings the heartbeat affirmed.
-	node, cpuConfigJSON, applied, err := s.nodes.IngestPulled(req, capturedAt, now)
+	// A heartbeat's response reaches the node, so it may deliver the
+	// one-shot CPU intersection; a pull's response is discarded, so it must
+	// not (#341 review, yingdi-shan).
+	node, cpuConfigJSON, applied, err := s.nodes.IngestPulled(req, capturedAt, now, report.fetchedAt.IsZero())
 	if err != nil {
 		return nil, ingestNodeError(s.logger, report.nodeID, err)
 	}

@@ -503,10 +503,12 @@ func TestPullIngestDoesNotConsumeCpuIntersection(t *testing.T) {
 		{ID: "node-b", Endpoint: "http://node-b"},
 	}, 30*time.Second)
 
-	// node-a reports: the intersection is not computable until node-b is
-	// observed with a config.
+	// Both nodes observed without configs (the cluster size is known via
+	// observed records), then node-a reports its config: the intersection
+	// stays withheld while node-b has none.
+	heartbeatWithConfig(t, registry, "node-b", "cluster-1", "svc-b", "")
 	if got := heartbeatWithConfig(t, registry, "node-a", "cluster-1", "svc-a", cfg); got != "" {
-		t.Fatal("before node-b is observed, expected empty intersection, got non-empty")
+		t.Fatal("before node-b has a config, expected empty intersection, got non-empty")
 	}
 
 	// A rebuild pull ingests node-b's data (including its CPU config). The
@@ -519,7 +521,7 @@ func TestPullIngestDoesNotConsumeCpuIntersection(t *testing.T) {
 		MachineInfo:       &schedulerv1.MachineInfo{CpuConfigJson: cfg},
 	}
 	now := time.Unix(200, 0)
-	if _, _, applied, err := registry.IngestPulled(pulled, now.Add(-time.Second), now); err != nil || !applied {
+	if _, _, applied, err := registry.IngestPulled(pulled, now.Add(-time.Second), now, false); err != nil || !applied {
 		t.Fatalf("pull ingest: applied=%v err=%v", applied, err)
 	}
 
