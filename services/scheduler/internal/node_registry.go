@@ -16,17 +16,17 @@ type NodeRegistry interface {
 	Snapshot(allowLingering bool) []Node
 	Contains(node Node) bool
 	Resolve(nodeID string) (Node, bool)
-	// IngestPulled applies a pulled observation only when it was captured no
-	// earlier than the node's latest report: check and update are one locked
-	// step, so a heartbeat landing mid-ingest always wins. applied is false
-	// when the pull was stale and nothing was ingested (#341 review,
+	// Ingest applies a heartbeat or pulled report only when it was captured
+	// no earlier than the node's latest report: check and update are one
+	// locked step, so a heartbeat landing mid-ingest always wins. applied is
+	// false when the report was stale and nothing was ingested (#341 review,
 	// guozy18). The wire timestamp stays millisecond-truncated; freshness is
 	// arbitrated on a full-precision ingest time kept alongside the record.
 	// deliverIntersection must be false for pulls: their response is
 	// discarded, so marking the one-shot CPU intersection as delivered
 	// would starve the node's next real heartbeat (#341 review,
 	// yingdi-shan).
-	IngestPulled(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time, deliverIntersection bool) (node Node, cpuConfigJSON string, applied bool, err error)
+	Ingest(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time, deliverIntersection bool) (node Node, cpuConfigJSON string, applied bool, err error)
 	ListObserved(clusterID string, now time.Time) []*schedulerv1.ObservedNode
 	ListP2pPeers(clusterID string, backend string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	FilterP2pPeers(clusterID string, backend string, nodeIDs []string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
@@ -41,10 +41,6 @@ type NodeRegistry interface {
 	// never reported. Used by the leader-election recovery window to tell
 	// fresh observations from pre-acquisition ones (#259).
 	LastReportAt(nodeID string) (time.Time, bool)
-	// P2PEndpointFor returns the node's last reported P2P endpoint, or nil.
-	// Read-only lookup used by the snapshot-pull path, whose admin source
-	// cannot provide the endpoint (#341 review).
-	P2PEndpointFor(nodeID string) *schedulerv1.P2PEndpoint
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -167,7 +163,7 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	return r.heartbeatLocked(req, now, true)
 }
 
-func (r *AtomicNodeRegistry) IngestPulled(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time, deliverIntersection bool) (Node, string, bool, error) {
+func (r *AtomicNodeRegistry) Ingest(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time, deliverIntersection bool) (Node, string, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if rec, ok := r.observed[req.GetNodeId()]; ok && rec.lastReportAt.After(fetchedAt) {
@@ -393,17 +389,6 @@ func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapsh
 		return nil
 	}
 	return cloneSnapshot(snapshot)
-}
-
-// P2PEndpointFor returns the node's last reported P2P endpoint, or nil.
-func (r *AtomicNodeRegistry) P2PEndpointFor(nodeID string) *schedulerv1.P2PEndpoint {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	record, ok := r.observed[nodeID]
-	if !ok {
-		return nil
-	}
-	return record.p2pEndpoint
 }
 
 func (r *AtomicNodeRegistry) LastReportAt(nodeID string) (time.Time, bool) {

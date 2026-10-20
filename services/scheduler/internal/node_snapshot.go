@@ -17,60 +17,14 @@ import (
 
 // ============================================================
 
-// nodeReport is the neutral currency of node-state ingestion (#259): what a
-// fetcher returns after successfully pulling a node, and what the shared
-// ingest path consumes. Both the Heartbeat RPC handler and
-// sync-node-snapshots convert into it; a fetcher never fabricates an RPC
-// request.
-type nodeReport struct {
-	nodeID            string
-	serviceInstanceID string
-	clusterID         string
-	version           string
-	commit            string
-	machineInfo       *schedulerv1.MachineInfo
-	snapshot          *schedulerv1.NodeSnapshot
-	// sandboxIDs carries the node's authoritative sandbox roster. Three
-	// states matter:
-	//   non-nil (including empty) — authoritative (heartbeat): reconcile
-	//     bindings to exactly this set;
-	//   nil — unknown (snapshot pull): bindings are left untouched. A pull
-	//     cannot see paused sandboxes or in-flight template builds, so
-	//     reconciling from it would delete live bindings on failover
-	//     (#341 review). Binding refresh stays with heartbeats, and the
-	//     binding TTL floor covers the gap.
-	sandboxIDs  []string
-	p2pEndpoint *schedulerv1.P2PEndpoint
-	// fetchedAt records when a pulled report's data was captured. A report
-	// built from a heartbeat leaves it zero (always fresh). The ingest guard
-	// uses it to keep a slow pull from overwriting a newer heartbeat
-	// (#341 review): skip the pull when the node has already reported
-	// something captured after this data.
-	fetchedAt time.Time
-}
-
-// toHeartbeatRequest converts the report to the registry's proto shape; the
-// conversion is contained here so the registry interface stays unchanged.
-func (r *nodeReport) toHeartbeatRequest() *schedulerv1.HeartbeatRequest {
-	return &schedulerv1.HeartbeatRequest{
-		NodeId:            r.nodeID,
-		ClusterId:         r.clusterID,
-		ServiceInstanceId: r.serviceInstanceID,
-		Version:           r.version,
-		Commit:            r.commit,
-		MachineInfo:       r.machineInfo,
-		Snapshot:          r.snapshot,
-		SandboxIds:        r.sandboxIDs,
-		P2PEndpoint:       r.p2pEndpoint,
-	}
-}
-
 // NodeSnapshotFetcher retrieves a single node's current snapshot from its
-// admin endpoints for sync-node-snapshots on leadership acquisition (#259).
-// It returns the fetched data (a nodeReport), not an RPC request. It is an
-// injected seam so the retrieval logic is testable without HTTP or node
-// credentials.
-type NodeSnapshotFetcher func(ctx context.Context, node Node) (*nodeReport, error)
+// admin endpoints for sync-node-snapshots on leadership acquisition (#259),
+// as a heartbeat-shaped request plus the time the data was captured.
+// fetchedAt drives the ingest guard that keeps a slow pull from overwriting
+// a newer heartbeat (#341 review): the pull is skipped when the node has
+// already reported something captured after this data. It is an injected
+// seam so the retrieval logic is testable without HTTP or node credentials.
+type NodeSnapshotFetcher func(ctx context.Context, node Node) (req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, err error)
 
 // pullNodeSnapshots drives the post-acquisition state rebuild
 // (sync-node-snapshots, #259): fan out a retrieval of every registry node's
@@ -79,7 +33,7 @@ type NodeSnapshotFetcher func(ctx context.Context, node Node) (*nodeReport, erro
 // is fetched exactly once; a failed retrieval is logged and leaves the node
 // unobserved (the recovery window's fresh-observations-only rule keeps it
 // out of scheduling until its next report).
-func pullNodeSnapshots(ctx context.Context, logger *zap.Logger, nodes []Node, fetch NodeSnapshotFetcher, ingest func(report *nodeReport, now time.Time) error, concurrency int) {
+func pullNodeSnapshots(ctx context.Context, logger *zap.Logger, nodes []Node, fetch NodeSnapshotFetcher, ingest func(req *schedulerv1.HeartbeatRequest, fetchedAt, now time.Time) error, concurrency int) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
@@ -95,16 +49,16 @@ func pullNodeSnapshots(ctx context.Context, logger *zap.Logger, nodes []Node, fe
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			report, err := fetch(ctx, node)
+			req, fetchedAt, err := fetch(ctx, node)
 			if err != nil {
 				logger.Warn("sync-node-snapshots: node snapshot pull failed",
 					zap.String("node_id", node.ID), zap.Error(err))
 				return
 			}
-			if report == nil {
+			if req == nil {
 				return
 			}
-			if err := ingest(report, time.Now()); err != nil {
+			if err := ingest(req, fetchedAt, time.Now()); err != nil {
 				logger.Warn("sync-node-snapshots: ingesting pulled snapshot failed",
 					zap.String("node_id", node.ID), zap.Error(err))
 			}
@@ -180,9 +134,9 @@ func adminStatusToProto(status string) schedulerv1.NodeStatus {
 
 // NewAdminSnapshotFetcher builds the production NodeSnapshotFetcher (#259,
 // sync-node-snapshots): it pulls GET {endpoint}/nodes for observations and
-// returns the fetched data as a nodeReport for the shared ingest path.
-// Bindings are deliberately not pulled (see nodeReport.sandboxIDs).
-// The node's admin API requires the X-Admin-Token header. The HTTP
+// shapes the response as a heartbeat-equivalent request for the shared
+// ingest path. The node's admin API requires the X-Admin-Token header
+// (OpenAPI AdminApiKeyAuth). The HTTP
 // client is an implementation detail with a bounded per-request timeout;
 // tests inject through the NodeSnapshotFetcher seam, not this constructor.
 func NewAdminSnapshotFetcher(apiKey string) NodeSnapshotFetcher {
@@ -196,7 +150,7 @@ func NewAdminSnapshotFetcher(apiKey string) NodeSnapshotFetcher {
 			return http.ErrUseLastResponse
 		},
 	}
-	return func(ctx context.Context, node Node) (*nodeReport, error) {
+	return func(ctx context.Context, node Node) (*schedulerv1.HeartbeatRequest, time.Time, error) {
 		base := strings.TrimRight(node.Endpoint, "/")
 		// Stamp the capture time before the request: a heartbeat landing
 		// while this request is in flight must count as newer than whatever
@@ -205,7 +159,7 @@ func NewAdminSnapshotFetcher(apiKey string) NodeSnapshotFetcher {
 
 		var nodes []adminNodeResponse
 		if err := adminGetJSON(ctx, client, apiKey, base+"/nodes", &nodes); err != nil {
-			return nil, fmt.Errorf("pull %s /nodes: %w", node.ID, err)
+			return nil, time.Time{}, fmt.Errorf("pull %s /nodes: %w", node.ID, err)
 		}
 		var entry *adminNodeResponse
 		for i := range nodes {
@@ -218,13 +172,10 @@ func NewAdminSnapshotFetcher(apiKey string) NodeSnapshotFetcher {
 		// misconfigured endpoint must not overwrite another node's
 		// observation (#341 review).
 		if entry == nil {
-			return nil, fmt.Errorf("pull %s /nodes: node not in admin response", node.ID)
+			return nil, time.Time{}, fmt.Errorf("pull %s /nodes: node not in admin response", node.ID)
 		}
 
-		// Only /nodes is pulled: observations, not the sandbox roster. See
-		// nodeReport.sandboxIDs for why the roster is never reconciled from
-		// a pull.
-		return reportFromAdmin(entry, fetchedAt), nil
+		return reportFromAdmin(entry), fetchedAt, nil
 	}
 }
 
@@ -250,11 +201,12 @@ func adminGetJSON(ctx context.Context, client *http.Client, apiKey, url string, 
 	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(out)
 }
 
-func reportFromAdmin(n *adminNodeResponse, fetchedAt time.Time) *nodeReport {
-	// The admin roster is authoritative when present (same source as
-	// heartbeat sandbox_ids: orchestrator.list_sandbox_ids), so a parity
-	// pull may reconcile bindings; an absent roster stays nil and skips
-	// reconciliation (#341 review).
+// reportFromAdmin shapes an admin /nodes entry as a heartbeat-equivalent
+// request. The admin roster is authoritative when present (same source as
+// heartbeat sandbox_ids: orchestrator.list_sandbox_ids), so a parity pull
+// may reconcile bindings; an absent roster stays nil and skips
+// reconciliation (#341 review).
+func reportFromAdmin(n *adminNodeResponse) *schedulerv1.HeartbeatRequest {
 	var sandboxIDs []string
 	if n.SandboxIDs != nil {
 		sandboxIDs = []string{}
@@ -278,23 +230,22 @@ func reportFromAdmin(n *adminNodeResponse, fetchedAt time.Time) *nodeReport {
 			TotalBytes:     d.TotalBytes,
 		})
 	}
-	return &nodeReport{
-		nodeID:            n.ID,
-		sandboxIDs:        sandboxIDs,
-		p2pEndpoint:       p2p,
-		clusterID:         n.ClusterID,
-		serviceInstanceID: n.ServiceInstanceID,
-		version:           n.Version,
-		commit:            n.Commit,
-		fetchedAt:         fetchedAt,
-		machineInfo: &schedulerv1.MachineInfo{
+	return &schedulerv1.HeartbeatRequest{
+		NodeId:            n.ID,
+		ClusterId:         n.ClusterID,
+		ServiceInstanceId: n.ServiceInstanceID,
+		Version:           n.Version,
+		Commit:            n.Commit,
+		SandboxIds:        sandboxIDs,
+		P2PEndpoint:       p2p,
+		MachineInfo: &schedulerv1.MachineInfo{
 			CpuFamily:       n.MachineInfo.CPUFamily,
 			CpuModel:        n.MachineInfo.CPUModel,
 			CpuModelName:    n.MachineInfo.CPUModelName,
 			CpuArchitecture: n.MachineInfo.CPUArchitecture,
 			CpuConfigJson:   n.MachineInfo.CPUConfigJSON,
 		},
-		snapshot: &schedulerv1.NodeSnapshot{
+		Snapshot: &schedulerv1.NodeSnapshot{
 			Status:                     adminStatusToProto(n.Status),
 			AllocatedCpu:               n.Metrics.AllocatedCPU,
 			AllocatedMemoryBytes:       n.Metrics.AllocatedMemoryBytes,

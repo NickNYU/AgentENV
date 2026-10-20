@@ -27,7 +27,7 @@ func TestStalePullSameMillisecondMustNotOverwriteHeartbeat(t *testing.T) {
 
 	// A heartbeat lands at T+200µs: newer data, same millisecond. Its
 	// roster carries the freshly created sandbox.
-	heartbeat := nodeReportFromProto(&schedulerv1.HeartbeatRequest{
+	heartbeat := &schedulerv1.HeartbeatRequest{
 		NodeId:            "node-a",
 		ServiceInstanceId: "svc-1",
 		SandboxIds:        []string{"sbx-new"},
@@ -35,24 +35,23 @@ func TestStalePullSameMillisecondMustNotOverwriteHeartbeat(t *testing.T) {
 			Status:       schedulerv1.NodeStatus_NODE_STATUS_READY,
 			SandboxCount: 100,
 		},
-	})
-	if _, err := service.ingestNodeReport(heartbeat, base.Add(200*time.Microsecond)); err != nil {
+	}
+	if _, err := service.ingestNodeReport(heartbeat, time.Time{}, base.Add(200*time.Microsecond)); err != nil {
 		t.Fatalf("heartbeat ingest failed: %v", err)
 	}
 
 	// The stale pull response arrives: captured before the heartbeat, it
 	// holds an older snapshot and a roster without sbx-new.
-	stale := &nodeReport{
-		nodeID:            "node-a",
-		serviceInstanceID: "svc-1",
-		fetchedAt:         fetchedAt,
-		sandboxIDs:        []string{},
-		snapshot: &schedulerv1.NodeSnapshot{
+	stale := &schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ServiceInstanceId: "svc-1",
+		SandboxIds:        []string{},
+		Snapshot: &schedulerv1.NodeSnapshot{
 			Status:       schedulerv1.NodeStatus_NODE_STATUS_READY,
 			SandboxCount: 1,
 		},
 	}
-	if _, err := service.ingestNodeReport(stale, base.Add(300*time.Microsecond)); err != nil {
+	if _, err := service.ingestNodeReport(stale, fetchedAt, base.Add(300*time.Microsecond)); err != nil {
 		t.Fatalf("stale pull ingest failed: %v", err)
 	}
 
@@ -73,7 +72,7 @@ func TestFreshPullStillIngestsAndReconciles(t *testing.T) {
 	store := NewInMemoryBindingStore(defaultObservedReportTTL)
 	service := NewService(zap.NewNop(), registry, NewStrategy("round_robin"), store)
 
-	heartbeat := nodeReportFromProto(&schedulerv1.HeartbeatRequest{
+	heartbeat := &schedulerv1.HeartbeatRequest{
 		NodeId:            "node-a",
 		ServiceInstanceId: "svc-1",
 		SandboxIds:        []string{"sbx-old"},
@@ -81,23 +80,22 @@ func TestFreshPullStillIngestsAndReconciles(t *testing.T) {
 			Status:       schedulerv1.NodeStatus_NODE_STATUS_READY,
 			SandboxCount: 1,
 		},
-	})
-	if _, err := service.ingestNodeReport(heartbeat, base); err != nil {
+	}
+	if _, err := service.ingestNodeReport(heartbeat, time.Time{}, base); err != nil {
 		t.Fatalf("heartbeat ingest failed: %v", err)
 	}
 
 	// Pull captured a second later: newer roster (sbx-old gone, sbx-new up).
-	fresh := &nodeReport{
-		nodeID:            "node-a",
-		serviceInstanceID: "svc-1",
-		fetchedAt:         base.Add(time.Second),
-		sandboxIDs:        []string{"sbx-new"},
-		snapshot: &schedulerv1.NodeSnapshot{
+	fresh := &schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ServiceInstanceId: "svc-1",
+		SandboxIds:        []string{"sbx-new"},
+		Snapshot: &schedulerv1.NodeSnapshot{
 			Status:       schedulerv1.NodeStatus_NODE_STATUS_READY,
 			SandboxCount: 1,
 		},
 	}
-	if _, err := service.ingestNodeReport(fresh, base.Add(2*time.Second)); err != nil {
+	if _, err := service.ingestNodeReport(fresh, base.Add(time.Second), base.Add(2*time.Second)); err != nil {
 		t.Fatalf("fresh pull ingest failed: %v", err)
 	}
 
@@ -122,13 +120,13 @@ func TestPullReconcileCannotOvertakeNewerHeartbeat(t *testing.T) {
 	service := NewService(zap.NewNop(), registry, NewStrategy("round_robin"), store)
 
 	// Seed the node so the pull is a rebuild, not a first report.
-	seed := nodeReportFromProto(&schedulerv1.HeartbeatRequest{
+	seed := &schedulerv1.HeartbeatRequest{
 		NodeId:            "node-a",
 		ServiceInstanceId: "svc-1",
 		SandboxIds:        []string{"sbx-old"},
 		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY, SandboxCount: 1},
-	})
-	if _, err := service.ingestNodeReport(seed, base); err != nil {
+	}
+	if _, err := service.ingestNodeReport(seed, time.Time{}, base); err != nil {
 		t.Fatalf("seed heartbeat: %v", err)
 	}
 
@@ -149,30 +147,29 @@ func TestPullReconcileCannotOvertakeNewerHeartbeat(t *testing.T) {
 
 	// The pull captured an empty roster at T2 (sbx-new did not exist yet)
 	// and passes the freshness check.
-	pull := &nodeReport{
-		nodeID:            "node-a",
-		serviceInstanceID: "svc-1",
-		fetchedAt:         base.Add(time.Second),
-		sandboxIDs:        []string{},
-		snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY, SandboxCount: 0},
+	pull := &schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ServiceInstanceId: "svc-1",
+		SandboxIds:        []string{},
+		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY, SandboxCount: 0},
 	}
 	pullDone := make(chan error, 1)
 	go func() {
-		_, err := service.ingestNodeReport(pull, base.Add(2*time.Second))
+		_, err := service.ingestNodeReport(pull, base.Add(time.Second), base.Add(2*time.Second))
 		pullDone <- err
 	}()
 	<-pullParked
 
 	// The heartbeat races in at T3 carrying both sandboxes.
-	heartbeat := nodeReportFromProto(&schedulerv1.HeartbeatRequest{
+	heartbeat := &schedulerv1.HeartbeatRequest{
 		NodeId:            "node-a",
 		ServiceInstanceId: "svc-1",
 		SandboxIds:        []string{"sbx-old", "sbx-new"},
 		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY, SandboxCount: 2},
-	})
+	}
 	hbDone := make(chan error, 1)
 	go func() {
-		_, err := service.ingestNodeReport(heartbeat, base.Add(3*time.Second))
+		_, err := service.ingestNodeReport(heartbeat, time.Time{}, base.Add(3*time.Second))
 		hbDone <- err
 	}()
 	// Without per-node ordering the heartbeat completes while the pull is

@@ -297,8 +297,13 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 	if nodeID == "" || serviceInstanceID == "" {
 		return nil, status.Error(codes.InvalidArgument, "node_id and service_instance_id are required")
 	}
-
-	return s.ingestNodeReport(nodeReportFromProto(req), s.now())
+	// A heartbeat roster is always authoritative, including when empty:
+	// proto3 decodes absent and empty repeated fields identically, so force
+	// a non-nil slice to keep heartbeats reconciling.
+	if req.SandboxIds == nil {
+		req.SandboxIds = []string{}
+	}
+	return s.ingestNodeReport(req, time.Time{}, s.now())
 }
 
 // ingestNodeError maps registry ingest failures to gRPC statuses.
@@ -312,29 +317,6 @@ func ingestNodeError(logger *zap.Logger, nodeID string, err error) error {
 	return status.Error(codes.Internal, "node registry heartbeat failed")
 }
 
-// nodeReportFromProto adapts a Heartbeat RPC request to the neutral ingest
-// currency. Identity validation already happened in Heartbeat.
-func nodeReportFromProto(req *schedulerv1.HeartbeatRequest) *nodeReport {
-	// A heartbeat roster is always authoritative, including when empty:
-	// proto3 decodes absent and empty repeated fields identically, so force
-	// a non-nil slice to keep heartbeats reconciling (see nodeReport).
-	sandboxIDs := req.GetSandboxIds()
-	if sandboxIDs == nil {
-		sandboxIDs = []string{}
-	}
-	return &nodeReport{
-		nodeID:            req.GetNodeId(),
-		clusterID:         req.GetClusterId(),
-		serviceInstanceID: req.GetServiceInstanceId(),
-		version:           req.GetVersion(),
-		commit:            req.GetCommit(),
-		machineInfo:       req.GetMachineInfo(),
-		snapshot:          req.GetSnapshot(),
-		sandboxIDs:        sandboxIDs,
-		p2pEndpoint:       req.GetP2PEndpoint(),
-	}
-}
-
 // ingestLock returns the per-node stripe serializing ingestNodeReport.
 func (s *Service) ingestLock(nodeID string) *sync.Mutex {
 	h := fnv.New32a()
@@ -344,25 +326,22 @@ func (s *Service) ingestLock(nodeID string) *sync.Mutex {
 
 // ingestNodeReport is the shared ingest path for heartbeat RPCs and pulled
 // node snapshots (sync-node-snapshots on leadership acquisition, #259):
-// update registry observations, then reconcile sandbox bindings.
-func (s *Service) ingestNodeReport(report *nodeReport, now time.Time) (*schedulerv1.HeartbeatResponse, error) {
+// update registry observations, then reconcile sandbox bindings. A zero
+// fetchedAt marks a heartbeat (the request is the capture, so it is always
+// fresh); a pulled report carries its capture time.
+func (s *Service) ingestNodeReport(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time) (*schedulerv1.HeartbeatResponse, error) {
 	// One ordered section per node: registry update, then binding
 	// reconcile. A heartbeat arriving while a pull is in this section waits;
 	// a pull arriving after a heartbeat fails the freshness check below and
 	// skips both steps (#341 wrap-up, guozy18).
-	stripe := s.ingestLock(report.nodeID)
+	stripe := s.ingestLock(req.GetNodeId())
 	stripe.Lock()
 	defer stripe.Unlock()
 
-	req := report.toHeartbeatRequest()
-	capturedAt := report.fetchedAt
+	capturedAt := fetchedAt
 	if capturedAt.IsZero() {
 		// Heartbeat: the request is the capture, so it is always fresh.
 		capturedAt = now
-	} else if req.P2PEndpoint == nil {
-		// The admin API does not serve the P2P endpoint; carry over the
-		// previously known one so a pull does not erase it (#341 review).
-		req.P2PEndpoint = s.nodes.P2PEndpointFor(report.nodeID)
 	}
 	// The registry applies the report only when it is not older than the
 	// node's latest report — check and update are one locked step, so a
@@ -372,24 +351,24 @@ func (s *Service) ingestNodeReport(report *nodeReport, now time.Time) (*schedule
 	// A heartbeat's response reaches the node, so it may deliver the
 	// one-shot CPU intersection; a pull's response is discarded, so it must
 	// not (#341 review, yingdi-shan).
-	node, cpuConfigJSON, applied, err := s.nodes.IngestPulled(req, capturedAt, now, report.fetchedAt.IsZero())
+	node, cpuConfigJSON, applied, err := s.nodes.Ingest(req, capturedAt, now, fetchedAt.IsZero())
 	if err != nil {
-		return nil, ingestNodeError(s.logger, report.nodeID, err)
+		return nil, ingestNodeError(s.logger, req.GetNodeId(), err)
 	}
 	if !applied {
 		return &schedulerv1.HeartbeatResponse{}, nil
 	}
 	// Reconcile only from an authoritative roster (heartbeat, or a
 	// heartbeat-parity pull). A pull whose admin source omits the roster
-	// leaves sandboxIDs nil — bindings are refreshed by heartbeats and
+	// leaves SandboxIds nil — bindings are refreshed by heartbeats and
 	// guarded meanwhile by the binding TTL floor (#341 review).
-	if report.sandboxIDs != nil {
+	if req.SandboxIds != nil {
 		if s.beforeReconcile != nil {
 			s.beforeReconcile()
 		}
-		if err := s.store.ReconcileNode(node, report.sandboxIDs, now); err != nil {
+		if err := s.store.ReconcileNode(node, req.GetSandboxIds(), now); err != nil {
 			s.logger.Warn("scheduler heartbeat binding reconcile failed",
-				zap.String("node_id", report.nodeID),
+				zap.String("node_id", req.GetNodeId()),
 				zap.Error(err),
 			)
 			return nil, status.Error(codes.Unavailable, "binding store unavailable")
