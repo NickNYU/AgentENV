@@ -180,34 +180,40 @@ func TestPulledIngestSkipsStaleReports(t *testing.T) {
 	svc, registry, _ := newTestService(t, []string{"node-a"})
 	t0 := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
 
+	report := func(count uint32) *schedulerv1.HeartbeatRequest {
+		return &schedulerv1.HeartbeatRequest{
+			NodeId:            "node-a",
+			ServiceInstanceId: "inst-1",
+			Snapshot:          &schedulerv1.NodeSnapshot{SandboxCount: count},
+		}
+	}
+
 	// A heartbeat lands at t0+1s.
-	if _, _, err := registry.Heartbeat(heartbeatFor("node-a", "inst-1"), t0.Add(time.Second)); err != nil {
+	if _, err := svc.ingestNodeReport(report(100), time.Time{}, t0.Add(time.Second)); err != nil {
 		t.Fatalf("heartbeat failed: %v", err)
 	}
-	before, _ := registry.LastReportAt("node-a")
 
 	// A pull captured before that heartbeat must not overwrite it.
-	stale := &schedulerv1.HeartbeatRequest{NodeId: "node-a", ServiceInstanceId: "inst-1"}
-	if _, err := svc.ingestNodeReport(stale, t0, t0.Add(2*time.Second)); err != nil {
+	if _, err := svc.ingestNodeReport(report(1), t0, t0.Add(2*time.Second)); err != nil {
 		t.Fatalf("stale pull ingest failed: %v", err)
 	}
-	after, _ := registry.LastReportAt("node-a")
-	if !after.Equal(before) {
-		t.Fatalf("stale pull must not overwrite the newer heartbeat: before=%v after=%v", before, after)
+	if got := registry.PeekObserved("node-a").GetSandboxCount(); got != 100 {
+		t.Fatalf("stale pull must not overwrite the newer heartbeat: sandbox count = %d, want 100", got)
 	}
 
 	// A pull captured after the heartbeat is applied.
-	fresh := &schedulerv1.HeartbeatRequest{NodeId: "node-a", ServiceInstanceId: "inst-1"}
-	if _, err := svc.ingestNodeReport(fresh, t0.Add(3*time.Second), t0.Add(3*time.Second)); err != nil {
+	if _, err := svc.ingestNodeReport(report(7), t0.Add(3*time.Second), t0.Add(3*time.Second)); err != nil {
 		t.Fatalf("fresh pull ingest failed: %v", err)
 	}
-	after2, _ := registry.LastReportAt("node-a")
-	if !after2.After(after) {
-		t.Fatalf("fresh pull must be applied: after=%v after2=%v", after, after2)
+	if got := registry.PeekObserved("node-a").GetSandboxCount(); got != 7 {
+		t.Fatalf("fresh pull must be applied: sandbox count = %d, want 7", got)
 	}
 
 	// Heartbeat-shaped reports (zero fetchedAt) always apply.
-	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-1"), time.Time{}, t0.Add(4*time.Second)); err != nil {
+	if _, err := svc.ingestNodeReport(report(9), time.Time{}, t0.Add(4*time.Second)); err != nil {
 		t.Fatalf("heartbeat-shaped ingest failed: %v", err)
+	}
+	if got := registry.PeekObserved("node-a").GetSandboxCount(); got != 9 {
+		t.Fatalf("heartbeat-shaped report must apply: sandbox count = %d, want 9", got)
 	}
 }

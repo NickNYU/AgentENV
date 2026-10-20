@@ -10,7 +10,7 @@ import (
 )
 
 // guozy18's review (#341): a pull that started before a heartbeat in the
-// same millisecond passed the freshness guard — LastReportAt is
+// same millisecond passed the freshness guard — the report timestamp was
 // millisecond-truncated, so the same-ms heartbeat compared as "not after"
 // the pull's capture time — and the stale pull overwrote the heartbeat's
 // observation. Deterministic; no goroutines needed. (Bindings are no longer

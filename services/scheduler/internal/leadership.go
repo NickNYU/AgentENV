@@ -29,11 +29,9 @@ import (
 // this package, everything goes through the Leadership facade.
 type leadershipView interface {
 	InRecoveryWindow(now time.Time) bool
-	LeaderSince() (time.Time, bool)
-	// RecoveryPending reports whether nodeID was known at acquisition and
-	// has not yet produced a post-acquisition report. A nil lastReportAt
-	// means the node never reported.
-	RecoveryPending(nodeID string, lastReportAt *time.Time) bool
+	// RecoveryPending reports whether nodeID was known at acquisition; a
+	// known node stays excluded from scheduling until its first observation.
+	RecoveryPending(nodeID string) bool
 }
 
 // Leadership is the single external contract for the scheduler's
@@ -78,13 +76,12 @@ func NewLeadership(logger *zap.Logger, cfg config.SchedulerConfig) Leadership {
 // a single-writer scheduler without any conditional wiring.
 type nonLeadership struct{}
 
-func (nonLeadership) InRecoveryWindow(time.Time) bool         { return false }
-func (nonLeadership) LeaderSince() (time.Time, bool)          { return time.Time{}, false }
-func (nonLeadership) RecoveryPending(string, *time.Time) bool { return false }
-func (nonLeadership) ServiceOption() ServiceOption            { return func(*Service) {} }
-func (nonLeadership) RegisterHealth(*health.Server)           {}
-func (nonLeadership) BindRuntime(*Service, NodeRegistry)      {}
-func (nonLeadership) MarkNotServing()                         {}
+func (nonLeadership) InRecoveryWindow(time.Time) bool    { return false }
+func (nonLeadership) RecoveryPending(string) bool        { return false }
+func (nonLeadership) ServiceOption() ServiceOption       { return func(*Service) {} }
+func (nonLeadership) RegisterHealth(*health.Server)      {}
+func (nonLeadership) BindRuntime(*Service, NodeRegistry) {}
+func (nonLeadership) MarkNotServing()                    {}
 func (nonLeadership) GateInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		return handler(ctx, req)
@@ -101,7 +98,7 @@ func (nonLeadership) Run(ctx context.Context, _ func()) error {
 // whether it currently holds the leader lease and, if so, when it acquired
 // it. The acquisition time drives the recovery window: right after winning,
 // observations and bindings are still rebuilding, so scheduling must only
-// consider nodes observed after that point (#259).
+// consider nodes that have reported since (#259).
 //
 // The value object carries no lock and no mutators. Transitions are owned by
 // LeadershipManager, which atomically swaps the current instance; readers
@@ -142,20 +139,13 @@ func acquiredLeadershipSnapshot(recoveryTTL time.Duration, now time.Time, knownN
 	return &leadershipSnapshot{leader: true, since: now, recoveryTTL: recoveryTTL, knownNodes: known}
 }
 
-// RecoveryPending reports whether nodeID was known at acquisition and has
-// not yet produced a post-acquisition report (lastReportAt is the node's
-// latest report time, ok=false when it never reported).
-func (l *leadershipSnapshot) RecoveryPending(nodeID string, lastReportAt *time.Time) bool {
-	if !l.leader || !l.knownNodes[nodeID] {
-		return false
-	}
-	if lastReportAt == nil {
-		return true
-	}
-	// Millisecond-precision comparison, matching the scheduler's freshness
-	// rule (#341 review): a report in the same millisecond as the
-	// acquisition counts as post-acquisition.
-	return lastReportAt.UnixMilli() < l.since.UnixMilli()
+// RecoveryPending reports whether nodeID was known at acquisition. A
+// process acquires leadership at most once (it exits on loss) and standbys
+// ingest nothing, so every observation on the leader is post-acquisition by
+// construction — a known node is pending exactly while it has no
+// observation yet (#341 review, yingdi-shan).
+func (l *leadershipSnapshot) RecoveryPending(nodeID string) bool {
+	return l.leader && l.knownNodes[nodeID]
 }
 
 // InRecoveryWindow reports whether the recovery window following leadership
@@ -172,12 +162,6 @@ func (l *leadershipSnapshot) InRecoveryWindow(now time.Time) bool {
 
 func (l *leadershipSnapshot) IsLeader() bool {
 	return l.leader
-}
-
-// LeaderSince reports when leadership was acquired. The second return value
-// is false while this replica is not the leader.
-func (l *leadershipSnapshot) LeaderSince() (time.Time, bool) {
-	return l.since, l.leader
 }
 
 // ============================================================
@@ -248,14 +232,9 @@ func (l *leadershipManager) InRecoveryWindow(now time.Time) bool {
 	return l.state.Load().InRecoveryWindow(now)
 }
 
-// LeaderSince delegates to the internal leadership state.
-func (l *leadershipManager) LeaderSince() (time.Time, bool) {
-	return l.state.Load().LeaderSince()
-}
-
 // RecoveryPending delegates to the internal leadership state.
-func (l *leadershipManager) RecoveryPending(nodeID string, lastReportAt *time.Time) bool {
-	return l.state.Load().RecoveryPending(nodeID, lastReportAt)
+func (l *leadershipManager) RecoveryPending(nodeID string) bool {
+	return l.state.Load().RecoveryPending(nodeID)
 }
 
 // GateInterceptor returns the leader gate to chain into the gRPC server

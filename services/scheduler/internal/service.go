@@ -150,36 +150,21 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 
 // filterFreshObservations applies the fresh-observations-only rule (#259):
 // a node that was known at leadership acquisition is a scheduling candidate
-// only once it has reported at or after the acquisition — a timer alone
-// must not readmit a node whose reporter is still backing off (#341
-// review). Nodes that joined after the acquisition are not in the
-// recovery-pending set and keep the steady-state fail-open behaviour; with
-// leader election disabled everything passes.
+// only once it has reported — a timer alone must not readmit a node whose
+// reporter is still backing off (#341 review). A process acquires leadership
+// at most once and standbys ingest nothing, so every observation on the
+// leader is post-acquisition by construction and "observed" already implies
+// "fresh" (#341 review, yingdi-shan). Nodes that joined after the
+// acquisition are not in the recovery-pending set and keep the
+// steady-state fail-open behaviour; with leader election disabled
+// everything passes.
 func (s *Service) filterFreshObservations(rich []RichNode) []RichNode {
 	if s.leadership == nil {
 		return rich
 	}
-	since, ok := s.leadership.LeaderSince()
-	if !ok {
-		return rich
-	}
-	// Compare at millisecond precision: LastReportAt is reconstructed from a
-	// millisecond timestamp while the acquisition time has nanoseconds, so a
-	// report in the same millisecond as the acquisition must count as fresh
-	// (#341 review).
-	sinceMs := since.UnixMilli()
 	fresh := make([]RichNode, 0, len(rich))
 	for _, n := range rich {
-		at, reported := s.nodes.LastReportAt(n.Node.ID)
-		if reported && at.UnixMilli() >= sinceMs {
-			fresh = append(fresh, n)
-			continue
-		}
-		var lastReport *time.Time
-		if reported {
-			lastReport = &at
-		}
-		if !s.leadership.RecoveryPending(n.Node.ID, lastReport) {
+		if n.Snapshot != nil || !s.leadership.RecoveryPending(n.Node.ID) {
 			fresh = append(fresh, n)
 		}
 	}

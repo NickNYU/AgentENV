@@ -32,18 +32,11 @@ func TestLeadershipStates(t *testing.T) {
 	if standby.IsLeader() {
 		t.Fatal("a fresh replica must not be the leader")
 	}
-	if _, ok := standby.LeaderSince(); ok {
-		t.Fatal("LeaderSince must be false before acquisition")
-	}
 
 	t0 := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	leader := acquiredLeadershipSnapshot(30*time.Second, t0)
 	if !leader.IsLeader() {
 		t.Fatal("acquiredLeadership must be the leader")
-	}
-	since, ok := leader.LeaderSince()
-	if !ok || !since.Equal(t0) {
-		t.Fatalf("LeaderSince after acquisition = (%v, %v); want (%v, true)", since, ok, t0)
 	}
 }
 
