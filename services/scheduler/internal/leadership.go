@@ -51,12 +51,10 @@ type Leadership interface {
 	// RegisterHealth registers the leader readiness service; no-op when
 	// election is disabled.
 	RegisterHealth(hs *health.Server)
-	// BindRuntime attaches the post-construction dependencies for
-	// sync-node-snapshots; no-op when election is disabled.
-	BindRuntime(svc *Service, registry NodeRegistry)
-	// Run drives leader election until ctx is done; returns immediately
+	// Run drives leader election until ctx is done; svc and registry feed
+	// the post-acquisition sync-node-snapshots rebuild. Returns immediately
 	// when election is disabled.
-	Run(ctx context.Context, onStop func()) error
+	Run(ctx context.Context, svc *Service, registry NodeRegistry, onStop func()) error
 	// MarkNotServing flips leader readiness off; no-op when disabled.
 	MarkNotServing()
 }
@@ -79,15 +77,14 @@ type nonLeadership struct{}
 func (nonLeadership) InRecoveryWindow(time.Time) bool { return false }
 func (nonLeadership) RecoveryPending(string) bool     { return false }
 func (nonLeadership) ServiceOption() ServiceOption    { return func(*Service) {} }
-func (nonLeadership) RegisterHealth(*health.Server)           {}
-func (nonLeadership) BindRuntime(*Service, NodeRegistry)      {}
-func (nonLeadership) MarkNotServing()                         {}
+func (nonLeadership) RegisterHealth(*health.Server)   {}
+func (nonLeadership) MarkNotServing()                 {}
 func (nonLeadership) GateInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		return handler(ctx, req)
 	}
 }
-func (nonLeadership) Run(ctx context.Context, _ func()) error {
+func (nonLeadership) Run(ctx context.Context, _ *Service, _ NodeRegistry, _ func()) error {
 	<-ctx.Done()
 	return nil
 }
@@ -181,19 +178,17 @@ var LeaderHealthService = schedulerv1.Scheduler_ServiceDesc.ServiceName + "/lead
 // health service, and the elector callbacks (readiness flip +
 // sync-node-snapshots on acquire; readiness flip + stop hook on loss).
 //
-// Construction is two-phase to cut a construction cycle: the Service needs
-// the leadership state early (ServiceOption), while the post-acquisition
-// retrieval needs the Service and registry late (BindRuntime). Call order:
+// The Service needs the leadership state early (ServiceOption), while the
+// post-acquisition retrieval needs the Service and registry late, so Run
+// takes them as arguments. Call order:
 //
 //	NewLeadershipManager → ServiceOption / GateInterceptor → (build Service)
-//	→ BindRuntime → RegisterHealth → Run
+//	→ RegisterHealth → Run(svc, registry, …)
 type leadershipManager struct {
 	logger    *zap.Logger
 	cfg       config.SchedulerConfig
 	state     atomic.Pointer[leadershipSnapshot]
 	health    *health.Server
-	svc       *Service
-	registry  NodeRegistry
 	identity  string
 	clientset kubernetes.Interface
 }
@@ -347,25 +342,14 @@ func (l *leadershipManager) MarkNotServing() {
 	}
 }
 
-// TODO(#341, B5 — author review): pass svc/registry as Run arguments
-// instead, removing this two-phase init, the nil guards in
-// onStartedLeading and the "run before BindRuntime" error path
-// (yingdi-shan).
-//
-// BindRuntime attaches the service-side dependencies needed by the
-// sync-node-snapshots retrieval on acquire. Must be called after Service
-// construction and before Run. The registry is the NodeRegistry interface:
-// the manager only lists nodes through it, never the concrete type.
-func (l *leadershipManager) BindRuntime(svc *Service, registry NodeRegistry) {
-	l.svc = svc
-	l.registry = registry
-}
-
 // Run drives leader election until ctx is done or the lease is lost; it
-// blocks. onStop is the composition root's shutdown hook (e.g. canceling the
-// process root context); it runs after the readiness flip so a partitioned
-// ex-leader stops serving before exiting (fencing, #259).
-func (l *leadershipManager) Run(ctx context.Context, onStop func()) error {
+// blocks. svc and registry feed the post-acquisition sync-node-snapshots
+// rebuild; the registry is the NodeRegistry interface: the manager only
+// lists nodes through it, never the concrete type. onStop is the
+// composition root's shutdown hook (e.g. canceling the process root
+// context); it runs after the readiness flip so a partitioned ex-leader
+// stops serving before exiting (fencing, #259).
+func (l *leadershipManager) Run(ctx context.Context, svc *Service, registry NodeRegistry, onStop func()) error {
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("leader election requires in-cluster kubernetes access: %w", err)
@@ -385,7 +369,7 @@ func (l *leadershipManager) Run(ctx context.Context, onStop func()) error {
 
 	elector := newLeaderElector(l.logger, l.cfg.LeaderElection,
 		clientset, hostname,
-		l.onStartedLeading,
+		func(ctx context.Context) { l.onStartedLeading(ctx, svc, registry) },
 		func() {
 			l.state.Store(newLeadershipSnapshot(l.cfg.ReportTTL))
 			l.MarkNotServing()
@@ -399,18 +383,14 @@ func (l *leadershipManager) Run(ctx context.Context, onStop func()) error {
 }
 
 // onStartedLeading is the elector's OnStartedLeading hook: readiness
-// SERVING, then kick off sync-node-snapshots — refresh observations and
-// bindings by pulling every node's admin snapshot instead of waiting for the
-// next reporter backoff (#259).
-func (l *leadershipManager) onStartedLeading(ctx context.Context) {
-	// Capture the acquisition-time node set for recovery-pending semantics;
-	// tolerate being called before BindRuntime (tests, construction-order
-	// guard).
+// SERVING, then kick off sync-node-snapshots — refresh observations by
+// pulling every node's admin snapshot instead of waiting for the next
+// reporter backoff (#259).
+func (l *leadershipManager) onStartedLeading(ctx context.Context, svc *Service, registry NodeRegistry) {
+	// Capture the acquisition-time node set for recovery-pending semantics.
 	known := make([]string, 0)
-	if l.registry != nil {
-		for _, n := range l.registry.Snapshot(false) {
-			known = append(known, n.ID)
-		}
+	for _, n := range registry.Snapshot(false) {
+		known = append(known, n.ID)
 	}
 	snap := acquiredLeadershipSnapshot(l.cfg.ReportTTL, time.Now(), known...)
 	snap.holderID = l.identity
@@ -418,18 +398,14 @@ func (l *leadershipManager) onStartedLeading(ctx context.Context) {
 	if l.health != nil {
 		l.health.SetServingStatus(LeaderHealthService, grpc_health_v1.HealthCheckResponse_SERVING)
 	}
-	if l.svc == nil || l.registry == nil {
-		l.logger.Error("leader lifecycle run before BindRuntime; skipping sync-node-snapshots")
-		return
-	}
 	ingestor := func(req *schedulerv1.HeartbeatRequest, fetchedAt, now time.Time) error {
 		// Freshness is enforced atomically inside the registry by
 		// HeartbeatUnlessStale (#341 review): a slow pull cannot overwrite a
 		// heartbeat that landed while the request was in flight.
-		_, err := l.svc.ingestNodeReport(req, fetchedAt, now)
+		_, err := svc.ingestNodeReport(req, fetchedAt, now)
 		return err
 	}
-	go pullNodeSnapshots(ctx, l.logger, l.registry.Snapshot(false),
+	go pullNodeSnapshots(ctx, l.logger, registry.Snapshot(false),
 		NewAdminSnapshotFetcher(l.cfg.NodeAdminAPIKey), ingestor,
 		l.cfg.LeaderElection.SnapshotPullConcurrency)
 }

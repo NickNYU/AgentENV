@@ -54,9 +54,9 @@ func main() {
 	//  3. Service + gate: the gRPC server chains metrics, then the
 	//     leader-only gate; a dedicated leader health service keeps Service
 	//     endpoints to the leader only.
-	//  4. Election: BindRuntime wires the post-acquisition rebuild
-	//     (sync-node-snapshots), then the elector runs — acquisition
-	//     rebuilds observations and bindings, loss drives step 1.
+	//  4. Election: the elector runs with the service and registry for the
+	//     post-acquisition rebuild (sync-node-snapshots) — acquisition
+	//     rebuilds observations, loss drives step 1.
 
 	// rootCancel lets a leadership loss drive the shutdown path as a signal,
 	// but with an important difference (#341 review): on leadership loss the
@@ -134,7 +134,6 @@ func main() {
 	leadership.RegisterHealth(hs)
 	grpc_health_v1.RegisterHealthServer(g, hs)
 
-	leadership.BindRuntime(svc, registry)
 	if waitForDiscoverySync {
 		select {
 		case <-discoveryReady:
@@ -144,7 +143,7 @@ func main() {
 		}
 	}
 	go func() {
-		if err := leadership.Run(sigCtx, leadershipLossStop); err != nil {
+		if err := leadership.Run(sigCtx, svc, registry, leadershipLossStop); err != nil {
 			logger.Fatal("leader election failed", zap.Error(err))
 		}
 	}()
