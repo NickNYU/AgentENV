@@ -40,8 +40,8 @@ func heartbeatFor(nodeID, instanceID string, sandboxIDs ...string) *schedulerv1.
 }
 
 // reportFor builds a heartbeat-shaped request: the roster is always
-// authoritative, including when empty (mirrors the Heartbeat handler's
-// nil-to-empty normalization).
+// authoritative, including when empty (heartbeat ingests reconcile keyed on
+// the zero fetchedAt).
 func reportFor(nodeID, instanceID string, sandboxIDs ...string) *schedulerv1.HeartbeatRequest {
 	req := heartbeatFor(nodeID, instanceID, sandboxIDs...)
 	if req.SandboxIds == nil {
@@ -232,10 +232,11 @@ func TestLookupNodeWindowSemantics(t *testing.T) {
 	}
 }
 
-// Case F4 regression (#341 review): a snapshot pull carries no roster, so
-// pulling must never delete existing bindings — including bindings for
-// paused sandboxes that no list endpoint would report.
-func TestPullIngestPreservesBindingsWithoutRoster(t *testing.T) {
+// Case F4 regression (#341 review): pulls refresh observations only and
+// never reconcile, so pulling must never delete existing bindings —
+// including bindings for paused sandboxes that no list endpoint would
+// report.
+func TestPullIngestPreservesBindings(t *testing.T) {
 	svc, registry, store := newTestService(t, []string{"node-a"})
 
 	// A binding exists, e.g. for a paused sandbox.
@@ -243,9 +244,9 @@ func TestPullIngestPreservesBindingsWithoutRoster(t *testing.T) {
 		t.Fatalf("seed binding failed: %v", err)
 	}
 
-	// A pull-shaped report: observations present, roster unknown (nil).
+	// A pull (non-zero fetchedAt): observations ingest, reconcile is skipped.
 	pulled := &schedulerv1.HeartbeatRequest{NodeId: "node-a", ServiceInstanceId: "inst-a"}
-	if _, err := svc.ingestNodeReport(pulled, time.Time{}, time.Now()); err != nil {
+	if _, err := svc.ingestNodeReport(pulled, time.Now(), time.Now()); err != nil {
 		t.Fatalf("pull ingest failed: %v", err)
 	}
 

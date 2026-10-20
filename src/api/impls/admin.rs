@@ -70,7 +70,6 @@ impl From<NodeSnapshot> for models::Node {
             node.sandbox_starting_count,
             node.paused_sandbox_count,
         );
-        out.sandbox_ids = Some(node.sandbox_ids.iter().map(|id| id.to_string()).collect());
         out.p2p_endpoint = node
             .p2p_endpoint
             .map(|ep| models::P2pEndpoint::new(ep.backend, ep.address));

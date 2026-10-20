@@ -83,7 +83,6 @@ type adminNodeResponse struct {
 	SandboxStartingCnt uint32   `json:"sandboxStartingCount"`
 	SandboxPausedCount uint32   `json:"sandboxPausedCount"`
 	Status             string   `json:"status"`
-	SandboxIDs         []string `json:"sandboxIDs"`
 	P2pEndpoint        *struct {
 		Backend string `json:"backend"`
 		Address string `json:"address"`
@@ -200,23 +199,9 @@ func adminGetJSON(ctx context.Context, client *http.Client, apiKey, url string, 
 }
 
 // reportFromAdmin shapes an admin /nodes entry as a heartbeat-equivalent
-// request. The admin roster is authoritative when present (same source as
-// heartbeat sandbox_ids: orchestrator.list_sandbox_ids), so a parity pull
-// may reconcile bindings; an absent roster stays nil and skips
-// reconciliation (#341 review).
+// request carrying observations only: pulls never reconcile bindings, so
+// the roster is not mapped (heartbeats deliver it; #341 review).
 func reportFromAdmin(n *adminNodeResponse) *schedulerv1.HeartbeatRequest {
-	// TODO(#341, B1 — author review): with observations-only pulls this
-	// roster decoding goes, and the Rust admin /nodes sandboxIDs addition
-	// with it (cpuConfigJSON and p2pEndpoint stay).
-	var sandboxIDs []string
-	if n.SandboxIDs != nil {
-		sandboxIDs = []string{}
-		for _, id := range n.SandboxIDs {
-			if strings.TrimSpace(id) != "" {
-				sandboxIDs = append(sandboxIDs, id)
-			}
-		}
-	}
 	var p2p *schedulerv1.P2PEndpoint
 	if n.P2pEndpoint != nil {
 		p2p = &schedulerv1.P2PEndpoint{Backend: n.P2pEndpoint.Backend, Address: n.P2pEndpoint.Address}
@@ -237,7 +222,6 @@ func reportFromAdmin(n *adminNodeResponse) *schedulerv1.HeartbeatRequest {
 		ServiceInstanceId: n.ServiceInstanceID,
 		Version:           n.Version,
 		Commit:            n.Commit,
-		SandboxIds:        sandboxIDs,
 		P2PEndpoint:       p2p,
 		MachineInfo: &schedulerv1.MachineInfo{
 			CpuFamily:       n.MachineInfo.CPUFamily,
