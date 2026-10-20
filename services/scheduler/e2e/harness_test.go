@@ -292,14 +292,29 @@ func TestTakeoverSchedulingSemantics(t *testing.T) {
 // T4 (guozy's R3 delayed-write case, yingdi-shan's review ⑤): a
 // demoted-but-ALIVE leader must stop serving. Cut the leader off from the
 // API server (iptables REJECT from an ephemeral netadmin container — Kind's
-// kindnet ignores NetworkPolicy): the process stays alive and keeps its
-// local leader flag, but its holder check fails closed within seconds, so
-// the gate rejects the delayed write while the process is still running.
-// The standby then takes over and serves the same write, and once the renew
-// deadline passes the ex-leader force-stops (issue ②) and restarts as
-// standby. A freeze/resume (SIGSTOP/SIGCONT) cannot probe this: on resume
-// the renew timer fires immediately, so the process exits within
-// milliseconds — before any probe can reach it (run 38496719364).
+// kindnet ignores NetworkPolicy) and probe the timing invariant directly
+// (lease_duration 15s, renew_deadline 10s, retry_period 2s):
+//
+//   - after the last successful renew at T, wait.Until waits retry_period
+//     (2s) and then polls for up to renew_deadline (10s):
+//     OnStoppedLeading fires and the process force-stops by ~T+12s;
+//   - the standby acquires no earlier than T + lease_duration (~T+15s;
+//     the Lease stores whole seconds and expiry uses the observer's own
+//     clock, so no synchronized clocks are needed), after the old leader
+//     has stopped — no overlap. Config validation enforces
+//     lease_duration (whole seconds) > renew_deadline + retry_period so
+//     the ordering holds for any accepted triple (#341 maintainer review;
+//     the holder watch that used to fail the gate closed faster is
+//     removed, a self-invalidating gate follows on
+//     feat/scheduler-elect-loop).
+//
+// Writes the victim serves right after isolation are LEGAL — it is still
+// the single writer until OnStoppedLeading — so the probe keeps polling
+// through early successes and accepts "not the leader" or a broken
+// connection (the process force-stopped) as the stop signal. A
+// freeze/resume (SIGSTOP/SIGCONT) cannot probe this: on resume the renew
+// timer fires immediately, so the process exits within milliseconds —
+// before any probe can reach it (run 38496719364).
 func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	ctx := context.Background()
 
@@ -353,22 +368,22 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	defer demotedConn.Close()
 	demoted := schedulerv1.NewSchedulerClient(demotedConn)
 
-	// The gate must flip within the holder-check period (~1s) while the
-	// process is still alive; the force-stop comes RenewDeadline (10s)
-	// after the last successful renew, so the 6s budget keeps the probe
-	// comfortably inside the live window.
-	eventually(t, 6*time.Second, "live demoted leader's gate rejects the delayed write", func() (bool, error) {
-		if out := kube(t, "get", "pod", victim, "-o", "jsonpath={.status.containerStatuses[0].restartCount}"); out != restartsAtStart {
-			return false, fmt.Errorf("victim restarted before its live gate could be probed")
-		}
+	// The victim stops serving writes within renew_deadline of its last
+	// successful renew (~10s), either with a gated "not the leader" or by
+	// force-stopping (which kills the port-forward). Early successes are
+	// legal single-writer serves, not a dual-leader window — keep polling.
+	eventually(t, 15*time.Second, "demoted leader stops serving the delayed write", func() (bool, error) {
 		_, err := demoted.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{
 			SandboxId: "sbx-e2e-t4",
 			Node:      &schedulerv1.Node{NodeId: "node-a"},
 		})
 		if err == nil {
-			return false, fmt.Errorf("demoted leader still accepts writes (dual-leader window open)")
+			return false, nil
 		}
-		return strings.Contains(err.Error(), "not the leader"), nil
+		msg := err.Error()
+		return strings.Contains(msg, "not the leader") ||
+			strings.Contains(msg, "connect") ||
+			strings.Contains(msg, "EOF"), nil
 	})
 
 	// The standby takes over once the lease expires.

@@ -110,12 +110,6 @@ type leadershipSnapshot struct {
 	// still backing off (#341 review). Nodes that join later are not in the
 	// set and keep the steady-state fail-open behavior.
 	knownNodes map[string]bool
-	// holderID is the Lease's current holder identity, refreshed from the
-	// API server. The gate requires it to match this replica's identity —
-	// the local acquisition flag alone lags the real holder by up to
-	// renew_deadline, opening a dual-leader window (#341 maintainer review,
-	// issue ①).
-	holderID string
 }
 
 // newLeadership is the not-leading state. recoveryTTL bounds the recovery
@@ -185,12 +179,10 @@ var LeaderHealthService = schedulerv1.Scheduler_ServiceDesc.ServiceName + "/lead
 //	NewLeadershipManager → ServiceOption / GateInterceptor → (build Service)
 //	→ RegisterHealth → Run(svc, registry, …)
 type leadershipManager struct {
-	logger    *zap.Logger
-	cfg       config.SchedulerConfig
-	state     atomic.Pointer[leadershipSnapshot]
-	health    *health.Server
-	identity  string
-	clientset kubernetes.Interface
+	logger *zap.Logger
+	cfg    config.SchedulerConfig
+	state  atomic.Pointer[leadershipSnapshot]
+	health *health.Server
 }
 
 // NewLeadershipManager builds the manager and its Leadership state. It must
@@ -268,40 +260,24 @@ func (l *leadershipManager) RegisterHealth(hs *health.Server) {
 	hs.SetServingStatus(LeaderHealthService, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
 }
 
+// TODO(#341 follow-up — feat/scheduler-elect-loop): the gate trusts only
+// the local acquisition flag, which lags the real Lease holder by up to
+// retry_period + renew_deadline. The configured inequality
+// lease_duration (whole seconds) > renew_deadline + retry_period
+// (enforced in config validation) makes client-go stop the old leader
+// before any standby can acquire, so no two replicas serve concurrently
+// (#341 maintainer review, yingdi-shan). A self-invalidating gate
+// (serving deadline = last renew + lease_duration/2, driven by a
+// single-goroutine elect loop) replaces the local flag on the follow-up
+// branch.
+//
+// isServingLeader reports whether this replica may serve leader-gated RPCs.
+func (l *leadershipManager) isServingLeader() bool {
+	return l.state.Load().IsLeader()
+}
+
 // MarkNotServing flips the leader readiness service off; called on
 // leadership loss (before process shutdown) and during graceful shutdown.
-// isServingLeader reports whether this replica may serve leader-gated
-// RPCs: it must hold the local acquisition flag AND the Lease's current
-// holder must be itself (#341 maintainer review, issue ①).
-func (l *leadershipManager) isServingLeader() bool {
-	s := l.state.Load()
-	return s.IsLeader() && s.holderID == l.identity
-}
-
-// refreshHolderOnce re-reads the Lease from the API server and stores the
-// current holder identity in the state snapshot. Get failures (including a
-// missing Lease) clear the holder, which fails the gate closed — the safe
-// direction for a partitioned or demoted replica.
-func (l *leadershipManager) refreshHolderOnce(ctx context.Context) {
-	if l.clientset == nil {
-		return
-	}
-	holder := ""
-	if lease, err := l.clientset.CoordinationV1().Leases(l.cfg.LeaderElection.LeaseNamespace).
-		Get(ctx, l.cfg.LeaderElection.LeaseName, metav1.GetOptions{}); err == nil && lease.Spec.HolderIdentity != nil {
-		holder = *lease.Spec.HolderIdentity
-	}
-	cur := l.state.Load()
-	next := &leadershipSnapshot{
-		leader:      cur.leader,
-		since:       cur.since,
-		recoveryTTL: cur.recoveryTTL,
-		knownNodes:  cur.knownNodes,
-		holderID:    holder,
-	}
-	l.state.Store(next)
-}
-
 func (l *leadershipManager) MarkNotServing() {
 	if l.health != nil {
 		l.health.SetServingStatus(LeaderHealthService, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
@@ -354,7 +330,6 @@ func (l *leadershipManager) onStartedLeading(ctx context.Context, svc *Service, 
 		known = append(known, n.ID)
 	}
 	snap := acquiredLeadershipSnapshot(l.cfg.ReportTTL, time.Now(), known...)
-	snap.holderID = l.identity
 	l.state.Store(snap)
 	if l.health != nil {
 		l.health.SetServingStatus(LeaderHealthService, grpc_health_v1.HealthCheckResponse_SERVING)
