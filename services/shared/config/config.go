@@ -533,10 +533,6 @@ func (c Config) Validate() error {
 	return c.validate(false)
 }
 
-// TODO(#341, A1 — author review): if the holder watch is removed (see
-// leadership.go), validate renew_deadline < lease_duration when election is
-// on — client-go then stops the old leader before the standby can acquire,
-// which is the invariant the no-dual-leader argument rests on (yingdi-shan).
 func (c Config) validate(schedulerQueryOnly bool) error {
 	if c.Service == "" {
 		return errors.New("service is required")
@@ -612,7 +608,12 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 			if strings.TrimSpace(le.LeaseNamespace) == "" {
 				return errors.New("scheduler.leader_election.lease_namespace is required")
 			}
-			// client-go leaderelection timing constraints.
+			// client-go leaderelection timing constraints. lease_duration >
+			// renew_deadline is load-bearing for the no-dual-leader argument:
+			// the old leader stops within renew_deadline of its last
+			// successful renew, while a standby acquires no earlier than
+			// lease_duration after the last recorded renew (#341 maintainer
+			// review, issue ①; yingdi-shan).
 			if le.LeaseDuration <= le.RenewDeadline {
 				return errors.New("scheduler.leader_election requires lease_duration > renew_deadline")
 			}

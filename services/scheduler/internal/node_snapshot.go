@@ -72,17 +72,17 @@ func pullNodeSnapshots(ctx context.Context, logger *zap.Logger, nodes []Node, fe
 // adminNodeResponse mirrors the agentenv server admin GET /nodes entry
 // (openapi: Node). Field names follow the API's camelCase JSON.
 type adminNodeResponse struct {
-	Version            string   `json:"version"`
-	Commit             string   `json:"commit"`
-	ID                 string   `json:"id"`
-	ServiceInstanceID  string   `json:"serviceInstanceID"`
-	ClusterID          string   `json:"clusterID"`
-	SandboxCount       uint32   `json:"sandboxCount"`
-	CreateSuccesses    uint64   `json:"createSuccesses"`
-	CreateFails        uint64   `json:"createFails"`
-	SandboxStartingCnt uint32   `json:"sandboxStartingCount"`
-	SandboxPausedCount uint32   `json:"sandboxPausedCount"`
-	Status             string   `json:"status"`
+	Version            string `json:"version"`
+	Commit             string `json:"commit"`
+	ID                 string `json:"id"`
+	ServiceInstanceID  string `json:"serviceInstanceID"`
+	ClusterID          string `json:"clusterID"`
+	SandboxCount       uint32 `json:"sandboxCount"`
+	CreateSuccesses    uint64 `json:"createSuccesses"`
+	CreateFails        uint64 `json:"createFails"`
+	SandboxStartingCnt uint32 `json:"sandboxStartingCount"`
+	SandboxPausedCount uint32 `json:"sandboxPausedCount"`
+	Status             string `json:"status"`
 	P2pEndpoint        *struct {
 		Backend string `json:"backend"`
 		Address string `json:"address"`
