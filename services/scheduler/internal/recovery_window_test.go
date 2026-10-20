@@ -39,8 +39,15 @@ func heartbeatFor(nodeID, instanceID string, sandboxIDs ...string) *schedulerv1.
 	}
 }
 
-func reportFor(nodeID, instanceID string, sandboxIDs ...string) *nodeReport {
-	return nodeReportFromProto(heartbeatFor(nodeID, instanceID, sandboxIDs...))
+// reportFor builds a heartbeat-shaped request: the roster is always
+// authoritative, including when empty (mirrors the Heartbeat handler's
+// nil-to-empty normalization).
+func reportFor(nodeID, instanceID string, sandboxIDs ...string) *schedulerv1.HeartbeatRequest {
+	req := heartbeatFor(nodeID, instanceID, sandboxIDs...)
+	if req.SandboxIds == nil {
+		req.SandboxIds = []string{}
+	}
+	return req
 }
 
 // fixedClock is a controllable time source for window tests.
@@ -87,7 +94,7 @@ func TestIngestNodeReportSharedWithHeartbeat(t *testing.T) {
 
 	// Entry point 2: direct ingest (what sync-node-snapshots calls with a
 	// pulled admin /nodes snapshot). Same observable effects.
-	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-1", "sbx-2"), time.Now()); err != nil {
+	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-1", "sbx-2"), time.Time{}, time.Now()); err != nil {
 		t.Fatalf("direct ingest failed: %v", err)
 	}
 	if snap := registry.PeekObserved("node-a"); snap == nil {
@@ -116,11 +123,11 @@ func TestScheduleFreshOnlyDuringRecoveryWindow(t *testing.T) {
 	svc, _, _ := newLeaderTestService(t, []string{"node-a", "node-b"}, 30*time.Second, t0.Add(2*time.Second), t0)
 
 	// Stale observation: reported before acquisition.
-	if _, err := svc.ingestNodeReport(reportFor("node-b", "inst-b"), t0.Add(-10*time.Second)); err != nil {
+	if _, err := svc.ingestNodeReport(reportFor("node-b", "inst-b"), time.Time{}, t0.Add(-10*time.Second)); err != nil {
 		t.Fatalf("stale ingest failed: %v", err)
 	}
 	// Fresh observation: reported after acquisition.
-	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-a"), t0.Add(time.Second)); err != nil {
+	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-a"), time.Time{}, t0.Add(time.Second)); err != nil {
 		t.Fatalf("fresh ingest failed: %v", err)
 	}
 
@@ -143,7 +150,7 @@ func TestScheduleZeroFreshObservationsReturnsUnavailable(t *testing.T) {
 	svc, _, _ := newLeaderTestService(t, []string{"node-a"}, 30*time.Second, t0.Add(time.Second), t0)
 
 	// The only observation predates acquisition: nothing is fresh.
-	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-a"), t0.Add(-10*time.Second)); err != nil {
+	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-a"), time.Time{}, t0.Add(-10*time.Second)); err != nil {
 		t.Fatalf("stale ingest failed: %v", err)
 	}
 
@@ -161,15 +168,15 @@ func TestPullFailureKeepsNodeUnobserved(t *testing.T) {
 	svc, registry, _ := newLeaderTestService(t, []string{"node-a", "node-b"}, 30*time.Second, t0.Add(2*time.Second), t0)
 
 	var fetchCalls atomic.Int32
-	fetch := func(_ context.Context, node Node) (*nodeReport, error) {
+	fetch := func(_ context.Context, node Node) (*schedulerv1.HeartbeatRequest, time.Time, error) {
 		fetchCalls.Add(1)
 		if node.ID == "node-b" {
-			return nil, errors.New("admin endpoint unreachable")
+			return nil, time.Time{}, errors.New("admin endpoint unreachable")
 		}
-		return reportFor("node-a", "inst-a"), nil
+		return reportFor("node-a", "inst-a"), time.Now(), nil
 	}
-	ingest := func(report *nodeReport, now time.Time) error {
-		_, err := svc.ingestNodeReport(report, now)
+	ingest := func(req *schedulerv1.HeartbeatRequest, fetchedAt, now time.Time) error {
+		_, err := svc.ingestNodeReport(req, fetchedAt, now)
 		return err
 	}
 	pullNodeSnapshots(context.Background(), nil, registry.Snapshot(false), fetch, ingest, 2)
@@ -237,8 +244,8 @@ func TestPullIngestPreservesBindingsWithoutRoster(t *testing.T) {
 	}
 
 	// A pull-shaped report: observations present, roster unknown (nil).
-	pulled := &nodeReport{nodeID: "node-a", serviceInstanceID: "inst-a"}
-	if _, err := svc.ingestNodeReport(pulled, time.Now()); err != nil {
+	pulled := &schedulerv1.HeartbeatRequest{NodeId: "node-a", ServiceInstanceId: "inst-a"}
+	if _, err := svc.ingestNodeReport(pulled, time.Time{}, time.Now()); err != nil {
 		t.Fatalf("pull ingest failed: %v", err)
 	}
 

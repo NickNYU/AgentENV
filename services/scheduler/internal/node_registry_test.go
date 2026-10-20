@@ -521,7 +521,7 @@ func TestPullIngestDoesNotConsumeCpuIntersection(t *testing.T) {
 		MachineInfo:       &schedulerv1.MachineInfo{CpuConfigJson: cfg},
 	}
 	now := time.Unix(200, 0)
-	if _, _, applied, err := registry.IngestPulled(pulled, now.Add(-time.Second), now, false); err != nil || !applied {
+	if _, _, applied, err := registry.Ingest(pulled, now.Add(-time.Second), now, false); err != nil || !applied {
 		t.Fatalf("pull ingest: applied=%v err=%v", applied, err)
 	}
 

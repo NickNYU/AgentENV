@@ -450,11 +450,11 @@ func (l *leadershipManager) onStartedLeading(ctx context.Context) {
 		l.logger.Error("leader lifecycle run before BindRuntime; skipping sync-node-snapshots")
 		return
 	}
-	ingestor := func(report *nodeReport, now time.Time) error {
+	ingestor := func(req *schedulerv1.HeartbeatRequest, fetchedAt, now time.Time) error {
 		// Freshness is enforced atomically inside the registry by
 		// HeartbeatUnlessStale (#341 review): a slow pull cannot overwrite a
 		// heartbeat that landed while the request was in flight.
-		_, err := l.svc.ingestNodeReport(report, now)
+		_, err := l.svc.ingestNodeReport(req, fetchedAt, now)
 		return err
 	}
 	go pullNodeSnapshots(ctx, l.logger, l.registry.Snapshot(false),

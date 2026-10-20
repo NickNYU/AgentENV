@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	schedulerv1 "agentenv/services/api/proto"
 )
 
 // Sync-node-snapshots fetcher tests (#259): the production pull assembles a
@@ -67,15 +69,15 @@ func TestAdminSnapshotFetcherAssemblesHeartbeatShape(t *testing.T) {
 	srv := adminTestServer(t, "secret", adminNodeFixture, adminSandboxesFixture)
 	fetch := NewAdminSnapshotFetcher("secret")
 
-	req, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL})
+	req, _, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("fetch failed: %v", err)
 	}
 
-	if req.nodeID != "node-a" || req.serviceInstanceID != "inst-1" || req.clusterID != "cluster-1" {
+	if req.GetNodeId() != "node-a" || req.GetServiceInstanceId() != "inst-1" || req.GetClusterId() != "cluster-1" {
 		t.Fatalf("identity fields wrong: %v", req)
 	}
-	snap := req.snapshot
+	snap := req.GetSnapshot()
 	if snap == nil {
 		t.Fatal("snapshot must be populated")
 	}
@@ -90,8 +92,8 @@ func TestAdminSnapshotFetcherAssemblesHeartbeatShape(t *testing.T) {
 	}
 	// Nodes without the parity fields (older admin API) yield no roster;
 	// ingest must skip reconciliation for them.
-	if req.sandboxIDs != nil {
-		t.Fatalf("degraded pull must leave sandboxIDs nil, got %v", req.sandboxIDs)
+	if req.GetSandboxIds() != nil {
+		t.Fatalf("degraded pull must leave SandboxIds nil, got %v", req.GetSandboxIds())
 	}
 }
 
@@ -129,22 +131,22 @@ func TestAdminSnapshotFetcherParityFields(t *testing.T) {
 	srv := adminTestServer(t, "", adminParityNodeFixture, "[]")
 	fetch := NewAdminSnapshotFetcher("")
 
-	req, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL})
+	req, fetchedAt, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("fetch failed: %v", err)
 	}
-	if len(req.sandboxIDs) != 2 || req.sandboxIDs[0] != "sbx-1" || req.sandboxIDs[1] != "sbx-paused" {
-		t.Fatalf("parity roster mapping wrong: %v", req.sandboxIDs)
+	if ids := req.GetSandboxIds(); len(ids) != 2 || ids[0] != "sbx-1" || ids[1] != "sbx-paused" {
+		t.Fatalf("parity roster mapping wrong: %v", ids)
 	}
-	if req.p2pEndpoint == nil || req.p2pEndpoint.GetBackend() != "iroh" || req.p2pEndpoint.GetAddress() != "node-a.p2p.local" {
-		t.Fatalf("parity p2p mapping wrong: %v", req.p2pEndpoint)
+	if req.GetP2PEndpoint().GetBackend() != "iroh" || req.GetP2PEndpoint().GetAddress() != "node-a.p2p.local" {
+		t.Fatalf("parity p2p mapping wrong: %v", req.GetP2PEndpoint())
 	}
-	if req.machineInfo.GetCpuConfigJson() != `{"ht":true}` {
-		t.Fatalf("parity cpuConfigJSON mapping wrong: %q", req.machineInfo.GetCpuConfigJson())
+	if req.GetMachineInfo().GetCpuConfigJson() != `{"ht":true}` {
+		t.Fatalf("parity cpuConfigJSON mapping wrong: %q", req.GetMachineInfo().GetCpuConfigJson())
 	}
 
 	svc, _, store := newTestService(t, []string{"node-a"})
-	if _, err := svc.ingestNodeReport(req, time.Now()); err != nil {
+	if _, err := svc.ingestNodeReport(req, fetchedAt, time.Now()); err != nil {
 		t.Fatalf("parity pull ingest failed: %v", err)
 	}
 	// The authoritative roster reconciles bindings, including the paused one.
@@ -159,7 +161,7 @@ func TestAdminSnapshotFetcherAuthFailure(t *testing.T) {
 	srv := adminTestServer(t, "secret", adminNodeFixture, adminSandboxesFixture)
 	fetch := NewAdminSnapshotFetcher("wrong-key")
 
-	if _, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL}); err == nil {
+	if _, _, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL}); err == nil {
 		t.Fatal("fetch with a wrong key must fail")
 	}
 }
@@ -169,11 +171,11 @@ func TestAdminSnapshotFetcherHeartbeatIngestCompatibility(t *testing.T) {
 	fetch := NewAdminSnapshotFetcher("")
 
 	svc, registry, store := newTestService(t, []string{"node-a"})
-	req, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL})
+	req, fetchedAt, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("fetch failed: %v", err)
 	}
-	if _, err := svc.ingestNodeReport(req, time.Now()); err != nil {
+	if _, err := svc.ingestNodeReport(req, fetchedAt, time.Now()); err != nil {
 		t.Fatalf("pulled snapshot must ingest through the shared path: %v", err)
 	}
 	if registry.PeekObserved("node-a") == nil {
@@ -201,8 +203,8 @@ func TestPulledIngestSkipsStaleReports(t *testing.T) {
 	before, _ := registry.LastReportAt("node-a")
 
 	// A pull captured before that heartbeat must not overwrite it.
-	stale := &nodeReport{nodeID: "node-a", serviceInstanceID: "inst-1", fetchedAt: t0}
-	if _, err := svc.ingestNodeReport(stale, t0.Add(2*time.Second)); err != nil {
+	stale := &schedulerv1.HeartbeatRequest{NodeId: "node-a", ServiceInstanceId: "inst-1"}
+	if _, err := svc.ingestNodeReport(stale, t0, t0.Add(2*time.Second)); err != nil {
 		t.Fatalf("stale pull ingest failed: %v", err)
 	}
 	after, _ := registry.LastReportAt("node-a")
@@ -211,8 +213,8 @@ func TestPulledIngestSkipsStaleReports(t *testing.T) {
 	}
 
 	// A pull captured after the heartbeat is applied.
-	fresh := &nodeReport{nodeID: "node-a", serviceInstanceID: "inst-1", fetchedAt: t0.Add(3 * time.Second)}
-	if _, err := svc.ingestNodeReport(fresh, t0.Add(3*time.Second)); err != nil {
+	fresh := &schedulerv1.HeartbeatRequest{NodeId: "node-a", ServiceInstanceId: "inst-1"}
+	if _, err := svc.ingestNodeReport(fresh, t0.Add(3*time.Second), t0.Add(3*time.Second)); err != nil {
 		t.Fatalf("fresh pull ingest failed: %v", err)
 	}
 	after2, _ := registry.LastReportAt("node-a")
@@ -221,7 +223,7 @@ func TestPulledIngestSkipsStaleReports(t *testing.T) {
 	}
 
 	// Heartbeat-shaped reports (zero fetchedAt) always apply.
-	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-1"), t0.Add(4*time.Second)); err != nil {
+	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-1"), time.Time{}, t0.Add(4*time.Second)); err != nil {
 		t.Fatalf("heartbeat-shaped ingest failed: %v", err)
 	}
 }
