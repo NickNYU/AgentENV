@@ -97,7 +97,8 @@ func TestLeadershipManagerHealthTransitions(t *testing.T) {
 		t.Fatalf("initial leader health = %v; want NOT_SERVING until the lease is won", got)
 	}
 
-	lifecycle.onStartedLeading(context.Background())
+	svc, registry, _ := newTestService(t, nil)
+	lifecycle.onStartedLeading(context.Background(), svc, registry)
 	if got := check(); got != grpc_health_v1.HealthCheckResponse_SERVING {
 		t.Fatalf("leader health after acquisition = %v; want SERVING", got)
 	}
@@ -106,14 +107,6 @@ func TestLeadershipManagerHealthTransitions(t *testing.T) {
 	if got := check(); got != grpc_health_v1.HealthCheckResponse_NOT_SERVING {
 		t.Fatalf("leader health after MarkNotServing = %v; want NOT_SERVING", got)
 	}
-}
-
-// Construction-order guard: onStartedLeading before BindRuntime must not
-// panic or dereference the unbound service/registry; it logs and skips the
-// sync-node-snapshots retrieval.
-func TestLeadershipManagerAcquireBeforeBindRuntimeIsSafe(t *testing.T) {
-	lifecycle := newTestManager()
-	lifecycle.onStartedLeading(context.Background())
 }
 
 // ServiceOption attaches the lifecycle's Leadership to the Service, enabling
