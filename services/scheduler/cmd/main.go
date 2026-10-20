@@ -91,7 +91,10 @@ func main() {
 	// panic as "close of closed channel" (#341 review, guozy18).
 	waitForDiscoverySync := cfg.Scheduler.LeaderElection.Enabled && !*queryOnly &&
 		strings.EqualFold(strings.TrimSpace(cfg.Scheduler.Discovery.Mode), "kubernetes")
-	discoveryReady, discoveryReadyChans := discoveryReadyFor(waitForDiscoverySync)
+	var discoveryReady chan struct{}
+	if waitForDiscoverySync {
+		discoveryReady = make(chan struct{})
+	}
 	if *queryOnly {
 		qo := scheduler.NewQueryOnlyService(logger, store)
 		schedulerv1.RegisterSchedulerServer(g, qo)
@@ -100,7 +103,7 @@ func main() {
 		registry = scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
 		switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
 		case "kubernetes":
-			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry, discoveryReadyChans...)
+			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry, discoveryReady)
 		default:
 			nodes := make([]scheduler.Node, 0, len(cfg.Scheduler.Nodes))
 			for _, n := range cfg.Scheduler.Nodes {
@@ -266,7 +269,7 @@ func runKubernetesDiscoveryWithRetry(
 	logger *zap.Logger,
 	cfg config.SchedulerDiscoveryKubernetesConfig,
 	registry *scheduler.AtomicNodeRegistry,
-	ready ...chan<- struct{},
+	ready chan<- struct{},
 ) {
 	const (
 		initialBackoff = 1 * time.Second
@@ -282,7 +285,7 @@ func runKubernetesDiscoveryWithRetry(
 		}
 
 		attempt++
-		discovery, err := scheduler.NewKubernetesDiscovery(logger, cfg, registry, ready...)
+		discovery, err := scheduler.NewKubernetesDiscovery(logger, cfg, registry, ready)
 		if err != nil {
 			if errors.Is(err, rest.ErrNotInCluster) {
 				logger.Error("kubernetes discovery initialization failed with non-retryable error; stopping discovery loop",
