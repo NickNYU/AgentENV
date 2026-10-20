@@ -406,10 +406,9 @@ func (l *leadershipManager) onStartedLeading(ctx context.Context) {
 		_, err := l.svc.ingestNodeReport(report, now)
 		return err
 	}
-	var refresher nodeSnapshotRefresher = NewConcurrentNodeSnapshotRefresher(l.logger, ingestor,
-		NewAdminSnapshotFetcher(l.cfg.NodeAdminAPIKey),
+	go pullNodeSnapshots(ctx, l.logger, l.registry.Snapshot(false),
+		NewAdminSnapshotFetcher(l.cfg.NodeAdminAPIKey), ingestor,
 		l.cfg.LeaderElection.SnapshotPullConcurrency)
-	go refresher.Refresh(ctx, l.registry.Snapshot(false))
 }
 
 // ============================================================

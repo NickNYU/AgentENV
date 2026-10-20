@@ -17,15 +17,6 @@ import (
 
 // ============================================================
 
-// nodeSnapshotRefresher is this file's contract: refresh the leader's
-// observations and bindings for a set of nodes by pulling their admin
-// snapshots (sync-node-snapshots, #259). The only production implementation
-// is ConcurrentNodeSnapshotRefresher; callers (the leadership manager) depend on this
-// interface, not on the concrete type.
-type nodeSnapshotRefresher interface {
-	Refresh(ctx context.Context, nodes []Node)
-}
-
 // nodeReport is the neutral currency of node-state ingestion (#259): what a
 // fetcher returns after successfully pulling a node, and what the shared
 // ingest path consumes. Both the Heartbeat RPC handler and
@@ -81,40 +72,21 @@ func (r *nodeReport) toHeartbeatRequest() *schedulerv1.HeartbeatRequest {
 // credentials.
 type NodeSnapshotFetcher func(ctx context.Context, node Node) (*nodeReport, error)
 
-// ConcurrentNodeSnapshotRefresher drives the post-acquisition state rebuild: fan out a
-// retrieval of every registry node's snapshot with bounded concurrency and
-// feed each response through the shared ingest path (ingestNodeReport — the
-// same code a heartbeat takes). A failed retrieval leaves that node
-// unobserved; the recovery window's fresh-observations-only rule keeps it out of
-// scheduling until its next report.
-// nodeReportIngester is the retriever's only dependency on the Service: the
-// shared ingest path. The retriever never holds the Service itself.
-type nodeReportIngester func(report *nodeReport, now time.Time) error
-
-type ConcurrentNodeSnapshotRefresher struct {
-	logger      *zap.Logger
-	ingest      nodeReportIngester
-	fetch       NodeSnapshotFetcher
-	concurrency int
-}
-
-func NewConcurrentNodeSnapshotRefresher(logger *zap.Logger, ingest nodeReportIngester, fetch NodeSnapshotFetcher, concurrency int) *ConcurrentNodeSnapshotRefresher {
+// pullNodeSnapshots drives the post-acquisition state rebuild
+// (sync-node-snapshots, #259): fan out a retrieval of every registry node's
+// snapshot with bounded concurrency and feed each response through the
+// shared ingest path (ingest — the same code a heartbeat takes). Every node
+// is fetched exactly once; a failed retrieval is logged and leaves the node
+// unobserved (the recovery window's fresh-observations-only rule keeps it
+// out of scheduling until its next report).
+func pullNodeSnapshots(ctx context.Context, logger *zap.Logger, nodes []Node, fetch NodeSnapshotFetcher, ingest func(report *nodeReport, now time.Time) error, concurrency int) {
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	if concurrency <= 0 {
 		concurrency = 4
 	}
-	return &ConcurrentNodeSnapshotRefresher{logger: logger, ingest: ingest, fetch: fetch, concurrency: concurrency}
-}
-
-// Refresh pulls a snapshot from every node in nodes and ingests the results.
-// Every node is fetched exactly once, successes are ingested, failures are
-// logged and leave the node unobserved (the recovery window's
-// fresh-observations-only rule keeps it out of scheduling until its next
-// report).
-func (r *ConcurrentNodeSnapshotRefresher) Refresh(ctx context.Context, nodes []Node) {
-	sem := make(chan struct{}, r.concurrency)
+	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	for _, node := range nodes {
 		node := node
@@ -123,17 +95,17 @@ func (r *ConcurrentNodeSnapshotRefresher) Refresh(ctx context.Context, nodes []N
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			report, err := r.fetch(ctx, node)
+			report, err := fetch(ctx, node)
 			if err != nil {
-				r.logger.Warn("sync-node-snapshots: node snapshot pull failed",
+				logger.Warn("sync-node-snapshots: node snapshot pull failed",
 					zap.String("node_id", node.ID), zap.Error(err))
 				return
 			}
 			if report == nil {
 				return
 			}
-			if err := r.ingest(report, time.Now()); err != nil {
-				r.logger.Warn("sync-node-snapshots: ingesting pulled snapshot failed",
+			if err := ingest(report, time.Now()); err != nil {
+				logger.Warn("sync-node-snapshots: ingesting pulled snapshot failed",
 					zap.String("node_id", node.ID), zap.Error(err))
 			}
 		}()
