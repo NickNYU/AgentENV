@@ -36,15 +36,6 @@ type NodeRegistry interface {
 	// and returns only the raw snapshot suitable for scheduling decisions.
 	// Returns nil if the node has never sent a heartbeat.
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
-	// TODO(#341, B2 — author review): with observations post-acquisition by
-	// construction, this interface method isn't needed; the full-precision
-	// lastReportAt stays private for the pull freshness check (yingdi-shan).
-	//
-	// LastReportAt returns when the given node last reported (heartbeat or
-	// pulled snapshot). The second return value is false if the node has
-	// never reported. Used by the leader-election recovery window to tell
-	// fresh observations from pre-acquisition ones (#259).
-	LastReportAt(nodeID string) (time.Time, bool)
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -393,20 +384,6 @@ func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapsh
 		return nil
 	}
 	return cloneSnapshot(snapshot)
-}
-
-func (r *AtomicNodeRegistry) LastReportAt(nodeID string) (time.Time, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	record, ok := r.observed[nodeID]
-	if !ok || record.node == nil {
-		return time.Time{}, false
-	}
-	ms := record.node.GetLastSeenUnixMs()
-	if ms <= 0 {
-		return time.Time{}, false
-	}
-	return time.UnixMilli(ms), true
 }
 
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {

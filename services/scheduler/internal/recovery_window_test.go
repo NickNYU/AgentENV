@@ -104,31 +104,23 @@ func TestIngestNodeReportSharedWithHeartbeat(t *testing.T) {
 	if err != nil || !ok || node.ID != "node-a" {
 		t.Fatalf("direct ingest must reconcile bindings: ok=%v node=%v err=%v", ok, node, err)
 	}
-
-	// Both entry points also stamp the same freshness marker the recovery
-	// window reads.
-	if _, ok := registry.LastReportAt("node-a"); !ok {
-		t.Fatal("ingest must stamp LastReportAt for the recovery window")
-	}
 }
 
 // Case D1: fresh-observations-only scheduling inside the recovery window.
 //
-// node-b's only observation predates acquisition (stale); node-a reported
-// after (fresh). Round-robin over both candidates would alternate
-// node-a → node-b on consecutive calls; the fresh-observations-only filter must pin every
-// pick to node-a.
+// node-b was known at acquisition and has not reported; node-a has.
+// Round-robin over both candidates would alternate node-a → node-b on
+// consecutive calls; the fresh-observations-only filter must pin every
+// pick to node-a. (A pre-acquisition observation cannot be staged here:
+// standbys ingest nothing, so every observation on the leader is
+// post-acquisition by construction.)
 func TestScheduleFreshOnlyDuringRecoveryWindow(t *testing.T) {
 	t0 := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	svc, _, _ := newLeaderTestService(t, []string{"node-a", "node-b"}, 30*time.Second, t0.Add(2*time.Second), t0)
 
-	// Stale observation: reported before acquisition.
-	if _, err := svc.ingestNodeReport(reportFor("node-b", "inst-b"), time.Time{}, t0.Add(-10*time.Second)); err != nil {
-		t.Fatalf("stale ingest failed: %v", err)
-	}
-	// Fresh observation: reported after acquisition.
+	// node-a reports; node-b (known at acquisition) stays unobserved.
 	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-a"), time.Time{}, t0.Add(time.Second)); err != nil {
-		t.Fatalf("fresh ingest failed: %v", err)
+		t.Fatalf("ingest failed: %v", err)
 	}
 
 	for i := 0; i < 2; i++ {
@@ -137,23 +129,19 @@ func TestScheduleFreshOnlyDuringRecoveryWindow(t *testing.T) {
 			t.Fatalf("schedule %d failed: %v", i, err)
 		}
 		if got := resp.GetNode().GetNodeId(); got != "node-a" {
-			t.Fatalf("schedule %d picked %q; want node-a — node-b's observation predates acquisition and must not be a candidate", i, got)
+			t.Fatalf("schedule %d picked %q; want node-a — node-b was known at acquisition and has no observation yet", i, got)
 		}
 	}
 }
 
-// Case D2: zero fresh observations — Schedule must return Unavailable and
-// never fall back to unobserved nodes (#191: no snapshot means "unknown",
-// not "unlimited").
+// Case D2: a known node with zero observations — Schedule must return
+// Unavailable and never fall back to unobserved nodes (#191: no snapshot
+// means "unknown", not "unlimited").
 func TestScheduleZeroFreshObservationsReturnsUnavailable(t *testing.T) {
 	t0 := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
 	svc, _, _ := newLeaderTestService(t, []string{"node-a"}, 30*time.Second, t0.Add(time.Second), t0)
 
-	// The only observation predates acquisition: nothing is fresh.
-	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-a"), time.Time{}, t0.Add(-10*time.Second)); err != nil {
-		t.Fatalf("stale ingest failed: %v", err)
-	}
-
+	// node-a was known at acquisition and has not reported.
 	_, err := svc.Schedule(context.Background(), &schedulerv1.ScheduleRequest{})
 	if status.Code(err) != codes.Unavailable {
 		t.Fatalf("want Unavailable with zero fresh observations, got %v", err)
@@ -184,10 +172,10 @@ func TestPullFailureKeepsNodeUnobserved(t *testing.T) {
 	if fetchCalls.Load() != 2 {
 		t.Fatalf("rebuild must pull every node exactly once; got %d fetches for 2 nodes", fetchCalls.Load())
 	}
-	if _, ok := registry.LastReportAt("node-a"); !ok {
+	if registry.PeekObserved("node-a") == nil {
 		t.Fatal("a successful pull must observe node-a")
 	}
-	if _, ok := registry.LastReportAt("node-b"); ok {
+	if registry.PeekObserved("node-b") != nil {
 		t.Fatal("a failed pull must leave node-b unobserved")
 	}
 
