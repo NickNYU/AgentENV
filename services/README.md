@@ -134,6 +134,17 @@ Because Service endpoints contain only the leader, `LookupNode` is served only b
 - Without `redis_addr` (degraded mode): bindings die with the old leader's process, so lookups for pre-failover sandboxes keep failing after the gap until those sandboxes are recreated. New scheduling is unaffected.
 - Closing the gap entirely (standbys serving reads) is deferred to a dedicated follow-up issue; this section describes the shipped behavior.
 
+#### In-flight writes during failover (accepted residual)
+
+The leader gate fences request *entry*, not writes already in flight. When the old leader loses the lease it force-stops, but a handler that already passed the gate (`RecordAssignment`, `Heartbeat` reconcile) can still commit its Redis write after the new leader takes over — there is no store-level fencing token (#341 review).
+
+This is accepted, not fixed, because the damage is bounded and self-healing:
+
+- The window is the few hundred milliseconds between the old leader's force-stop and its process exit; the no-dual-leader timing invariant (`lease_duration` whole seconds `> renew_deadline + retry_period`, enforced by config validation) already guarantees no *new* request is served concurrently by two replicas.
+- Every binding write is idempotent and TTL-bound, and heartbeats carry an authoritative roster: a binding wrongly deleted by a stale in-flight reconcile is restored by the node's next heartbeat (within one report interval); a stale `RecordAssignment` is overwritten by the gateway's retry onto the new leader.
+
+If this ever becomes observable in practice, the tracked follow-up is a store-level fencing token: every write carries the leader's epoch (from the Lease) and Redis applies it only if the epoch is not stale (conditional write).
+
 `scheduler.strategy` selects the algorithm used to pick a node from the eligible candidate list. Built-in strategies:
 
 | Strategy | Behaviour |
