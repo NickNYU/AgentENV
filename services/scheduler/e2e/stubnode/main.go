@@ -1,8 +1,8 @@
 // stubnode is a minimal agentenv-node double for scheduler HA e2e tests.
-// It serves the admin HTTP API the leader pulls (with heartbeat-parity
-// fields), sends periodic gRPC heartbeats, and exposes a /control plane
-// the test driver uses to inject metrics, sandbox rosters, and heartbeat
-// pauses.
+// It serves the admin HTTP API the leader pulls, sends periodic gRPC
+// heartbeats (the roster channel — pulls carry observations only), and
+// exposes a /control plane the test driver uses to inject metrics, sandbox
+// rosters, and heartbeat pauses.
 package main
 
 import (
@@ -166,7 +166,6 @@ func (s *stub) handleNodes(w http.ResponseWriter, _ *http.Request) {
 		"clusterID":            s.clusterID,
 		"status":               "ready",
 		"sandboxCount":         s.state.sandboxCount,
-		"sandboxIDs":           s.state.sandboxIDs,
 		"createSuccesses":      0,
 		"createFails":          0,
 		"sandboxStartingCount": 0,

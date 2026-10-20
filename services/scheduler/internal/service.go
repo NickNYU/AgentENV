@@ -4,9 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"strings"
-	"sync"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -30,14 +28,6 @@ type Service struct {
 	artifacts     ArtifactStore
 	resourceLimit *config.NodeResourceLimit
 	leadership    leadershipView
-	// ingestStripes serializes report ingestion per node (#341 wrap-up):
-	// the registry update and the binding reconcile must be one ordered
-	// section, or a slower pull's roster can delete bindings a newer
-	// heartbeat already affirmed. 64 stripes keep unrelated nodes parallel.
-	ingestStripes [64]sync.Mutex
-	// beforeReconcile is a test-only seam inside ingestNodeReport, between
-	// the registry ingest and the binding reconcile. Nil in production.
-	beforeReconcile func()
 	// for test cases, inject for time-related function checking on `inRecoveryWindow`
 	now func() time.Time
 }
@@ -297,12 +287,9 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 	if nodeID == "" || serviceInstanceID == "" {
 		return nil, status.Error(codes.InvalidArgument, "node_id and service_instance_id are required")
 	}
-	// A heartbeat roster is always authoritative, including when empty:
-	// proto3 decodes absent and empty repeated fields identically, so force
-	// a non-nil slice to keep heartbeats reconciling.
-	if req.SandboxIds == nil {
-		req.SandboxIds = []string{}
-	}
+	// A heartbeat roster is always authoritative, including when empty, so
+	// heartbeats always reconcile bindings (ingestNodeReport keys on the
+	// zero fetchedAt).
 	return s.ingestNodeReport(req, time.Time{}, s.now())
 }
 
@@ -317,27 +304,16 @@ func ingestNodeError(logger *zap.Logger, nodeID string, err error) error {
 	return status.Error(codes.Internal, "node registry heartbeat failed")
 }
 
-// ingestLock returns the per-node stripe serializing ingestNodeReport.
-func (s *Service) ingestLock(nodeID string) *sync.Mutex {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(nodeID))
-	return &s.ingestStripes[h.Sum32()%uint32(len(s.ingestStripes))]
-}
-
 // ingestNodeReport is the shared ingest path for heartbeat RPCs and pulled
-// node snapshots (sync-node-snapshots on leadership acquisition, #259):
-// update registry observations, then reconcile sandbox bindings. A zero
-// fetchedAt marks a heartbeat (the request is the capture, so it is always
-// fresh); a pulled report carries its capture time.
+// node snapshots (sync-node-snapshots on leadership acquisition, #259).
+// A zero fetchedAt marks a heartbeat (the request is the capture, so it is
+// always fresh); a pulled report carries its capture time. Only heartbeats
+// reconcile bindings: pulls refresh observations only — a pull cannot see
+// paused sandboxes or in-flight template builds, so reconciling from it
+// would delete live bindings on failover; Redis holds bindings under the
+// floored TTL until the node's next heartbeat reconciles (#341 review,
+// yingdi-shan).
 func (s *Service) ingestNodeReport(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time) (*schedulerv1.HeartbeatResponse, error) {
-	// One ordered section per node: registry update, then binding
-	// reconcile. A heartbeat arriving while a pull is in this section waits;
-	// a pull arriving after a heartbeat fails the freshness check below and
-	// skips both steps (#341 wrap-up, guozy18).
-	stripe := s.ingestLock(req.GetNodeId())
-	stripe.Lock()
-	defer stripe.Unlock()
-
 	capturedAt := fetchedAt
 	if capturedAt.IsZero() {
 		// Heartbeat: the request is the capture, so it is always fresh.
@@ -345,9 +321,7 @@ func (s *Service) ingestNodeReport(req *schedulerv1.HeartbeatRequest, fetchedAt 
 	}
 	// The registry applies the report only when it is not older than the
 	// node's latest report — check and update are one locked step, so a
-	// heartbeat landing mid-ingest always wins (#341 review, guozy18). A
-	// skipped pull must not reconcile either: its roster is just as stale
-	// and would delete bindings the heartbeat affirmed.
+	// heartbeat landing mid-ingest always wins (#341 review, guozy18).
 	// A heartbeat's response reaches the node, so it may deliver the
 	// one-shot CPU intersection; a pull's response is discarded, so it must
 	// not (#341 review, yingdi-shan).
@@ -358,14 +332,7 @@ func (s *Service) ingestNodeReport(req *schedulerv1.HeartbeatRequest, fetchedAt 
 	if !applied {
 		return &schedulerv1.HeartbeatResponse{}, nil
 	}
-	// Reconcile only from an authoritative roster (heartbeat, or a
-	// heartbeat-parity pull). A pull whose admin source omits the roster
-	// leaves SandboxIds nil — bindings are refreshed by heartbeats and
-	// guarded meanwhile by the binding TTL floor (#341 review).
-	if req.SandboxIds != nil {
-		if s.beforeReconcile != nil {
-			s.beforeReconcile()
-		}
+	if fetchedAt.IsZero() {
 		if err := s.store.ReconcileNode(node, req.GetSandboxIds(), now); err != nil {
 			s.logger.Warn("scheduler heartbeat binding reconcile failed",
 				zap.String("node_id", req.GetNodeId()),

@@ -1544,11 +1544,6 @@ components:
           description: Identifier of the cluster
         machineInfo:
           $ref: "#/components/schemas/MachineInfo"
-        sandboxIDs:
-          type: array
-          items:
-            type: string
-          description: IDs of all tracked sandboxes on the node, including paused sandboxes and template builds
         p2pEndpoint:
           $ref: "#/components/schemas/P2pEndpoint"
         status:

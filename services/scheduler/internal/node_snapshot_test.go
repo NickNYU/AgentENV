@@ -90,10 +90,10 @@ func TestAdminSnapshotFetcherAssemblesHeartbeatShape(t *testing.T) {
 	if len(snap.GetDisks()) != 1 || snap.GetDisks()[0].GetDevice() != "/dev/ublkb0" {
 		t.Fatalf("disk mapping wrong: %+v", snap.GetDisks())
 	}
-	// Nodes without the parity fields (older admin API) yield no roster;
-	// ingest must skip reconciliation for them.
+	// Pulls carry observations only: the roster is never mapped (#341
+	// review, yingdi-shan).
 	if req.GetSandboxIds() != nil {
-		t.Fatalf("degraded pull must leave SandboxIds nil, got %v", req.GetSandboxIds())
+		t.Fatalf("pull must leave SandboxIds nil, got %v", req.GetSandboxIds())
 	}
 }
 
@@ -108,7 +108,6 @@ const adminParityNodeFixture = `[{
   "createFails": 1,
   "sandboxStartingCount": 1,
   "sandboxPausedCount": 3,
-  "sandboxIDs": ["sbx-1", "sbx-paused"],
   "p2pEndpoint": {"backend": "iroh", "address": "node-a.p2p.local"},
   "machineInfo": {"cpuFamily": "6", "cpuModel": "85", "cpuModelName": "Xeon", "cpuArchitecture": "x86_64", "cpuConfigJSON": "{\"ht\":true}"},
   "metrics": {
@@ -125,35 +124,20 @@ const adminParityNodeFixture = `[{
 }]`
 
 // Parity path (#341 review): when the admin API exposes the heartbeat fields
-// (sandboxIDs, p2pEndpoint, cpuConfigJSON), the pull maps them through and
-// ingest reconciles bindings from the authoritative roster.
+// the pull keeps (p2pEndpoint, cpuConfigJSON), it maps them through.
 func TestAdminSnapshotFetcherParityFields(t *testing.T) {
 	srv := adminTestServer(t, "", adminParityNodeFixture, "[]")
 	fetch := NewAdminSnapshotFetcher("")
 
-	req, fetchedAt, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL})
+	req, _, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL})
 	if err != nil {
 		t.Fatalf("fetch failed: %v", err)
-	}
-	if ids := req.GetSandboxIds(); len(ids) != 2 || ids[0] != "sbx-1" || ids[1] != "sbx-paused" {
-		t.Fatalf("parity roster mapping wrong: %v", ids)
 	}
 	if req.GetP2PEndpoint().GetBackend() != "iroh" || req.GetP2PEndpoint().GetAddress() != "node-a.p2p.local" {
 		t.Fatalf("parity p2p mapping wrong: %v", req.GetP2PEndpoint())
 	}
 	if req.GetMachineInfo().GetCpuConfigJson() != `{"ht":true}` {
 		t.Fatalf("parity cpuConfigJSON mapping wrong: %q", req.GetMachineInfo().GetCpuConfigJson())
-	}
-
-	svc, _, store := newTestService(t, []string{"node-a"})
-	if _, err := svc.ingestNodeReport(req, fetchedAt, time.Now()); err != nil {
-		t.Fatalf("parity pull ingest failed: %v", err)
-	}
-	// The authoritative roster reconciles bindings, including the paused one.
-	for _, id := range []string{"sbx-1", "sbx-paused"} {
-		if _, ok, err := store.Get(id, time.Now()); err != nil || !ok {
-			t.Fatalf("parity pull must reconcile binding %s: ok=%v err=%v", id, ok, err)
-		}
 	}
 }
 

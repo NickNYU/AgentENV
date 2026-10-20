@@ -4828,12 +4828,6 @@ pub struct Node {
     #[validate(nested)]
     pub machine_info: models::MachineInfo,
 
-    /// IDs of all tracked sandboxes on the node, including paused sandboxes and template builds
-    #[serde(rename = "sandboxIDs")]
-    #[validate(custom(function = "check_xss_vec_string"))]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sandbox_ids: Option<Vec<String>>,
-
     #[serde(rename = "p2pEndpoint")]
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4892,7 +4886,6 @@ impl Node {
             service_instance_id,
             cluster_id,
             machine_info,
-            sandbox_ids: None,
             p2p_endpoint: None,
             status,
             sandbox_count,
@@ -4922,17 +4915,7 @@ impl std::fmt::Display for Node {
             Some("clusterID".to_string()),
             Some(self.cluster_id.to_string()),
             // Skipping machineInfo in query parameter serialization
-            self.sandbox_ids.as_ref().map(|sandbox_ids| {
-                [
-                    "sandboxIDs".to_string(),
-                    sandbox_ids
-                        .iter()
-                        .map(|x| x.to_string())
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ]
-                .join(",")
-            }),
+
             // Skipping p2pEndpoint in query parameter serialization
 
             // Skipping status in query parameter serialization
@@ -4974,7 +4957,6 @@ impl std::str::FromStr for Node {
             pub service_instance_id: Vec<String>,
             pub cluster_id: Vec<String>,
             pub machine_info: Vec<models::MachineInfo>,
-            pub sandbox_ids: Vec<Vec<String>>,
             pub p2p_endpoint: Vec<models::P2pEndpoint>,
             pub status: Vec<models::NodeStatus>,
             pub sandbox_count: Vec<u32>,
@@ -5029,12 +5011,6 @@ impl std::str::FromStr for Node {
                         <models::MachineInfo as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
                     ),
-                    "sandboxIDs" => {
-                        return std::result::Result::Err(
-                            "Parsing a container in this style is not supported in Node"
-                                .to_string(),
-                        );
-                    }
                     #[allow(clippy::redundant_clone)]
                     "p2pEndpoint" => intermediate_rep.p2p_endpoint.push(
                         <models::P2pEndpoint as std::str::FromStr>::from_str(val)
@@ -5114,7 +5090,6 @@ impl std::str::FromStr for Node {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "machineInfo missing in Node".to_string())?,
-            sandbox_ids: intermediate_rep.sandbox_ids.into_iter().next(),
             p2p_endpoint: intermediate_rep.p2p_endpoint.into_iter().next(),
             status: intermediate_rep
                 .status
