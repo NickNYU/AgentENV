@@ -172,8 +172,7 @@ func TestPullFailureKeepsNodeUnobserved(t *testing.T) {
 		_, err := svc.ingestNodeReport(report, now)
 		return err
 	}
-	refresher := NewConcurrentNodeSnapshotRefresher(nil, ingest, fetch, 2)
-	refresher.Refresh(context.Background(), registry.Snapshot(false))
+	pullNodeSnapshots(context.Background(), nil, registry.Snapshot(false), fetch, ingest, 2)
 
 	if fetchCalls.Load() != 2 {
 		t.Fatalf("rebuild must pull every node exactly once; got %d fetches for 2 nodes", fetchCalls.Load())
