@@ -16,6 +16,10 @@ on:
       - "deploy/k8s/**"
       - ".github/workflows/scheduler-ha-e2e.yml"
 
+# Least privilege: the job only checks out and builds code.
+permissions:
+  contents: read
+
 jobs:
   failover:
     runs-on: ubuntu-latest
@@ -28,7 +32,9 @@ jobs:
           go-version: "1.25"
 
       - name: Create Kind cluster
-        uses: helm/kind-action@v1
+        # helm/kind-action@v1, pinned to the tag's commit (supply-chain
+        # review finding).
+        uses: helm/kind-action@ef37e7f390d99f746eb8b610417061a60e82a6cc
         with:
           cluster_name: scheduler-ha-e2e
 

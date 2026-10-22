@@ -109,7 +109,13 @@ func (s *stub) heartbeatLoop(interval time.Duration) {
 		paused := s.state.pauseHeartbeats
 		s.state.mu.Unlock()
 		if !paused {
-			if _, err := s.client.Heartbeat(context.Background(), s.heartbeatRequest()); err != nil {
+			// Bounded context: an uncancelable RPC can hang forever when the
+			// connection lands on a SIGSTOPed scheduler pod (the pod still
+			// accepts TCP), which would stall every later heartbeat too.
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			_, err := s.client.Heartbeat(ctx, s.heartbeatRequest())
+			cancel()
+			if err != nil {
 				log.Printf("heartbeat failed: %v", err)
 			}
 		}

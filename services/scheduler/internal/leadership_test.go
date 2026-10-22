@@ -73,7 +73,7 @@ func TestLeadershipRecoveryWindowBoundaries(t *testing.T) {
 func newTestManager() *leadershipManager {
 	return newLeadershipManager(nil, config.SchedulerConfig{
 		ReportTTL:      30 * time.Second,
-		RedisAddr:      "localhost:6379", // shared store → standbys serve reads
+		RedisAddr:      "localhost:6379",
 		LeaderElection: config.SchedulerLeaderElectionConfig{Enabled: true},
 	})
 }

@@ -58,11 +58,19 @@ impl ObservabilityService {
     }
 
     pub fn take_cpu_config_json(&self) -> Option<String> {
-        self.pending_cpu_config.lock().unwrap().take()
+        // Recover from poisoning: a stale value beats panicking the
+        // heartbeat/admin path (matches snapshot/startup_pack.rs).
+        self.pending_cpu_config
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take()
     }
 
     pub fn store_cluster_cpu_config(&self, config: String) {
-        *self.cluster_cpu_config.write().unwrap() = Some(config);
+        *self
+            .cluster_cpu_config
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(config);
     }
 
     pub fn subscribe_sandbox_events(&self) -> broadcast::Receiver<SandboxLifecycleEvent> {
@@ -78,7 +86,11 @@ impl ObservabilityService {
         // #341 R5) need the cluster CPU config this node last received;
         // detect_machine_info() leaves the field unset.
         let mut machine_info = self.machine_info.clone();
-        machine_info.cpu_config_json = self.cluster_cpu_config.read().unwrap().clone();
+        machine_info.cpu_config_json = self
+            .cluster_cpu_config
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
 
         Ok(NodeSnapshot {
             version: self.identity.version.clone(),
