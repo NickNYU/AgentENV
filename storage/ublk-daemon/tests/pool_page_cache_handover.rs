@@ -23,9 +23,7 @@
 //!      buffered path, then clean up before the final regression assertion.
 //!
 //! Requires Linux with ublk (`make test-ublk` supplies CAP_SYS_ADMIN through
-//! scripts/run-with-capabilities.sh). Ignored by default: the final buffered
-//! assertion fails until the image-switch handover invalidates stale cache
-//! pages; un-ignore together with the fix for issue #302.
+//! scripts/run-with-capabilities.sh). On hosts without ublk the test skips.
 
 use std::alloc::{dealloc, Layout};
 use std::os::fd::AsRawFd;
@@ -336,7 +334,6 @@ impl Drop for DaemonCleanup {
 // Multi-thread runtime like the daemon binary: device setup performs blocking
 // work that would stall a current-thread test runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "issue #302: fails until the image-switch handover invalidates stale page cache; un-ignore with the fix"]
 async fn pooled_device_must_not_serve_stale_placeholder_pages() -> Result<()> {
     if !uvm_ublk::ublk_available() {
         eprintln!("skipping: ublk is not available on this host");

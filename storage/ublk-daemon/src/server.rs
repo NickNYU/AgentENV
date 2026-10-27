@@ -1525,6 +1525,12 @@ async fn prepare_overlaybd_device(
                 .with_context(|| format!("update {mode} device size for dev_id={dev_id}"))?;
         }
 
+        // Invalidate pages cached while the device was bound to the pool
+        // placeholder: the block-device page cache is keyed by inode, not by
+        // the target binding, so without this the new image would serve
+        // stale pages through the buffered path (issue #302).
+        clear_page_cache(&p.dev.device_path());
+
         Ok((p.dev, true))
     } else {
         tracing::debug!(mode, "pool miss: creating new device");
