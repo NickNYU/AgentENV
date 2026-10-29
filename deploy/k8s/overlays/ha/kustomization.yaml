@@ -30,6 +30,22 @@ patches:
       - op: replace
         path: /spec/replicas
         value: 3
+      # Only the leader is Ready, so 1 of 3 replicas is available at steady
+      # state. The rolling controller may remove an old pod only while
+      # available > desired - maxUnavailable; with a single available pod
+      # that inequality holds only for maxUnavailable: 100% (minAvailable 0).
+      # Anything smaller deadlocks the rollout: the surged new-version pod
+      # stays an unready standby while the old leader renews, and the
+      # controller can never remove an old pod (#341 review). maxSurge keeps
+      # one new-version pod warm to win the lease as old pods go away; the
+      # election gap is the same bounded failover gap as a leader death.
+      - op: add
+        path: /spec/strategy
+        value:
+          type: RollingUpdate
+          rollingUpdate:
+            maxSurge: 1
+            maxUnavailable: 100%
       - op: replace
         path: /spec/template/spec/containers/0/readinessProbe/exec/command
         value:

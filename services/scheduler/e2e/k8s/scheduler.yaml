@@ -68,6 +68,16 @@ metadata:
   name: agentenv-scheduler
 spec:
   replicas: 3
+  # Leader-only readiness leaves exactly one available pod, so the rolling
+  # controller can remove old pods only with minAvailable 0 — i.e.
+  # maxUnavailable 100% (tested by T5: an image update replaces all pods and
+  # the new replicas elect a new-image leader; any smaller budget deadlocks
+  # at three old pods plus one surged unready standby).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 100%
   selector:
     matchLabels:
       app: agentenv-scheduler

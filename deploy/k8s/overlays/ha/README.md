@@ -44,3 +44,22 @@ Upgrade ordering (rolling this out over a single-replica deployment):
 2. Then apply this overlay (RBAC, probe, replicas, config).
 
 Rollback: set `leader_election.enabled` to false and scale back to 1 replica.
+
+Image updates: the overlay pins `rollingUpdate.maxUnavailable: 100%` /
+`maxSurge: 1`. A default strategy deadlocks — the surged new-version pod is an
+unready standby while the old leader keeps renewing, and `maxUnavailable: 0`
+then forbids removing any old pod. Only one pod is ever Ready, so the
+controller needs `minAvailable: 0` to make progress; with `maxSurge: 1` a
+new-version pod is already warm when the old leader's lease expires. An image
+rollout therefore rides the same bounded, self-healing failover gap
+(~15–25s with defaults, see above), possibly more than once if the Lease passes
+between old-version standbys, and finishes with the holder on the new image:
+
+```bash
+kubectl set image deployment/agentenv-scheduler scheduler=<image>:<tag> -n agentenv-system
+kubectl get lease agentenv-scheduler -n agentenv-system -o jsonpath='{.spec.holderIdentity}'
+```
+
+`kubectl rollout status` completes once the pods are replaced (with
+`minAvailable: 0` it does not wait for a new leader); check the Lease holder's
+pod image for the real "new version is serving" signal.

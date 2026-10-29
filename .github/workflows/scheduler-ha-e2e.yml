@@ -44,7 +44,10 @@ jobs:
           cluster_name: scheduler-ha-e2e
 
       - name: Build scheduler image
-        run: docker build -f deploy/docker/Dockerfile.scheduler -t agentenv-scheduler:e2e .
+        run: |
+          docker build -f deploy/docker/Dockerfile.scheduler -t agentenv-scheduler:e2e .
+          # Second tag stands in for the "new version" in T5's rolling update.
+          docker tag agentenv-scheduler:e2e agentenv-scheduler:e2e-v2
 
       - name: Build stubnode image
         run: docker build -f services/scheduler/e2e/Dockerfile.stubnode -t agentenv-stubnode:e2e .
@@ -52,6 +55,7 @@ jobs:
       - name: Load images into Kind
         run: |
           kind load docker-image agentenv-scheduler:e2e --name scheduler-ha-e2e
+          kind load docker-image agentenv-scheduler:e2e-v2 --name scheduler-ha-e2e
           kind load docker-image agentenv-stubnode:e2e --name scheduler-ha-e2e
 
       - name: Deploy harness
@@ -61,9 +65,11 @@ jobs:
           kubectl apply -f services/scheduler/e2e/k8s/stubnodes.yaml
           kubectl rollout status deployment/redis --timeout=120s
           kubectl rollout status deployment/stubnode --timeout=120s
-          # NOTE: do not rollout-status the scheduler Deployment — by HA
-          # design only the elected leader is Ready, so a full rollout can
-          # never complete. The "Wait for a leader" step below is the gate.
+          # NOTE: do not rollout-status the scheduler Deployment: with
+          # maxUnavailable 100% it reports complete as soon as three new pods
+          # exist (minAvailable 0), i.e. before any of them wins the Lease.
+          # The "Wait for a leader" step below is the gate; T5 drives an
+          # actual image rollout and asserts a new-image leader takes over.
 
       - name: Wait for a leader
         run: |

@@ -413,6 +413,86 @@ func TestDemotedLeaderDelayedWrite(t *testing.T) {
 	})
 }
 
+// T5 (guozy18 rolling-update deadlock): an image update must replace every
+// old replica and finish with the Lease held by a pod running the new image.
+// Leader-only readiness means exactly one of the three pods is ever Ready,
+// so the rolling controller's scale-down condition (available pods >
+// desired - maxUnavailable) is satisfiable only with maxUnavailable: 100%.
+// With any smaller budget the rollout hangs at three old pods plus one
+// surged, unready standby; this test hangs at the first wait if the
+// strategy on the e2e Deployment is removed.
+func TestRollingImageUpdate(t *testing.T) {
+	ctx := context.Background()
+	const newImage = "agentenv-scheduler:e2e-v2"
+
+	if imageOf(t, leaderIdentity(t)) == newImage {
+		t.Skip("cluster already running the e2e-v2 image")
+	}
+
+	t.Log("triggering rolling image update to", newImage)
+	kube(t, "set", "image", "deployment/agentenv-scheduler", "scheduler="+newImage)
+
+	// Worst case the Lease passes old-standby -> old-standby as old pods are
+	// removed, so the rollout can ride a few failover windows (~15s each).
+	eventually(t, 3*time.Minute, "every scheduler pod runs the new image", func() (bool, error) {
+		images := schedulerPodImages(t)
+		if len(images) != 3 {
+			return false, nil
+		}
+		for pod, image := range images {
+			if image != newImage {
+				return false, fmt.Errorf("pod %s still on %s", pod, image)
+			}
+		}
+		return true, nil
+	})
+
+	eventually(t, 60*time.Second, "the elected leader runs the new image", func() (bool, error) {
+		holder := leaderIdentity(t)
+		if holder == "" {
+			return false, nil
+		}
+		return imageOf(t, holder) == newImage, nil
+	})
+	eventually(t, 60*time.Second, "exactly one ready endpoint after rollout", func() (bool, error) {
+		return len(schedulerEndpoints(t)) == 1, nil
+	})
+
+	forwardLeader(t)
+	client := dial(t)
+	eventually(t, 30*time.Second, "writes work on the new-version leader", func() (bool, error) {
+		_, err := client.RecordAssignment(ctx, &schedulerv1.RecordAssignmentRequest{
+			SandboxId: "sbx-e2e-t5",
+			Node:      firstDiscoveredNode(t, client),
+		})
+		return err == nil, nil
+	})
+}
+
+// schedulerPodImages maps live (non-terminating) scheduler pod names to
+// their scheduler-container image. The raw jsonpath appends a third field
+// for pods carrying a deletionTimestamp; those rows are dropped here.
+func schedulerPodImages(t *testing.T) map[string]string {
+	t.Helper()
+	out := kube(t, "get", "pods", "-l", "app=agentenv-scheduler",
+		"-o", "jsonpath={range .items[*]}{.metadata.name}{' '}{.spec.containers[0].image}{' '}{.metadata.deletionTimestamp}{'\\n'}{end}")
+	images := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 {
+			images[fields[0]] = fields[1]
+		}
+	}
+	return images
+}
+
+// imageOf returns the scheduler-container image of one pod.
+func imageOf(t *testing.T, pod string) string {
+	t.Helper()
+	return strings.TrimSpace(kube(t, "get", "pod", pod,
+		"-o", "jsonpath={.spec.containers[0].image}"))
+}
+
 // firstDiscoveredNode resolves a node through the scheduler's own discovery,
 // so RecordAssignment passes the service's known-node validation.
 func firstDiscoveredNode(t *testing.T, client schedulerv1.SchedulerClient) *schedulerv1.Node {
