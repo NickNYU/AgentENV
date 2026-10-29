@@ -486,11 +486,17 @@ func schedulerPodImages(t *testing.T) map[string]string {
 	return images
 }
 
-// imageOf returns the scheduler-container image of one pod.
+// imageOf returns the scheduler-container image of one pod. It returns ""
+// while the pod is gone: between leader deletion and a new acquisition the
+// Lease still names the old holder, so callers poll this during a gap.
 func imageOf(t *testing.T, pod string) string {
 	t.Helper()
-	return strings.TrimSpace(kube(t, "get", "pod", pod,
-		"-o", "jsonpath={.spec.containers[0].image}"))
+	out, err := exec.Command("kubectl", "get", "pod", pod,
+		"-o", "jsonpath={.spec.containers[0].image}").CombinedOutput()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // firstDiscoveredNode resolves a node through the scheduler's own discovery,
