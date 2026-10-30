@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3634a6fe.js";
+            window.path_to_searchindex_js = "../searchindex-87c97fc7.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a02e686b.js"></script>
+        <script src="../toc-7a242d67.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -206,6 +206,14 @@ make deploy-up
 <p><code>make deploy-up</code> builds the runtime, gateway, and scheduler images with Docker Compose
 before starting the stack. The Rust and Go toolchains are installed in the image
 build stages, so they are not required on the host.</p>
+<p>Runtime nodes mount the host’s upstream DNS configuration read-only for guest
+networks, including template builders. The <code>make deploy-*</code> targets select
+<code>/run/systemd/resolve/resolv.conf</code> when available, otherwise <code>/etc/resolv.conf</code>.
+Override <code>HOST_RESOLV_CONF</code> with an absolute path to a resolver file containing
+DNS servers reachable from guests; loopback addresses such as <code>127.0.0.53</code> and
+Docker’s <code>127.0.0.11</code> cannot be used by guests. Direct <code>docker compose</code> commands
+default to <code>/run/systemd/resolve/resolv.conf</code>; set <code>HOST_RESOLV_CONF</code> explicitly
+on hosts without that file. Containers retain Docker DNS for service discovery.</p>
 <p>To build without starting, run <code>make deploy-build</code>. To start images that are
 already built, run <code>make deploy-up-no-build</code>:</p>
 <pre><code class="language-bash"># Build only
@@ -254,15 +262,16 @@ both runtime nodes:</p>
 make deploy-up
 </code></pre>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
-<p>Container deployments use <code>deploy/docker/config/default.json</code>. Scheduler and backend node endpoints are configured for the Docker network.</p>
-<p>The compose manifest also wires node heartbeat reporting from runtime nodes to scheduler:</p>
-<ul>
-<li><code>AENV_NODE_ID</code> is set explicitly per node container (<code>node-a</code>, <code>node-b</code>).</li>
-<li><code>AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true</code> enables scheduler heartbeat reporting.</li>
-<li><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code> is set to <code>http://scheduler:9090</code>.</li>
-<li><code>SANDBOX_PROXY_DOMAINS</code>, when set, is passed through as both
-<code>GATEWAY_SANDBOX_PROXY_DOMAINS</code> and <code>AENV_SANDBOX_PROXY_DOMAINS</code>.</li>
-</ul>
+<p>The Scheduler and Gateway use <code>deploy/docker/config/default.json</code>. See
+<a href="../configuration/control-plane-config.html">Gateway and Scheduler Configuration</a> for JSON
+fields, environment overrides, HTTPS settings, and examples.</p>
+<p>After changing only the JSON, restart the affected services to reload it:</p>
+<pre><code class="language-bash">docker compose -f deploy/docker-compose.yml restart scheduler gateway
+</code></pre>
+<p>After changing Compose environment variables, ports, or mounts, apply the new
+container configuration using the existing images:</p>
+<pre><code class="language-bash">make deploy-up-no-build
+</code></pre>
 
                     </main>
 

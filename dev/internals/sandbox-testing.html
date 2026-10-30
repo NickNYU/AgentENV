@@ -28,7 +28,7 @@
         <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
 
         <!-- Custom theme stylesheets -->
-        <link rel="stylesheet" href="../theme/version-selector-d91336b6.css">
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
 
 
         <!-- Provide site root and default themes to javascript -->
@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3634a6fe.js";
+            window.path_to_searchindex_js = "../searchindex-87c97fc7.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-a02e686b.js"></script>
+        <script src="../toc-7a242d67.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -203,9 +203,9 @@
 <li><code>boot_args</code>: kernel boot args (e.g. <code>console=ttyS0 ... init=/init</code>).</li>
 <li><code>vcpu_count</code>, <code>mem_size_mib</code>: VM size.</li>
 <li><code>runtime_policy</code>: socket/envd timeouts and poll intervals.</li>
-<li><code>firecracker_stdout_path</code>, <code>firecracker_stderr_path</code>: capture FC logs.
-If unset, logs default to <code>work_dir/logs/firecracker-stdout.log</code> and
-<code>work_dir/logs/firecracker-stderr.log</code>.</li>
+<li><code>common.stdout_path</code>, <code>common.stderr_path</code>: explicit capture directories.
+Otherwise stdout/stderr capture is enabled only when <code>common.firecracker_log_level</code>
+is non-empty, using the serial directory or <code>work_dir/logs</code> fallback.</li>
 <li><code>envd_version</code>: expected envd version for the guest image.</li>
 <li><code>env_vars</code>: optional default environment variables injected after envd init.</li>
 <li><code>ublk_config</code>: optional ublk-backed rootfs configuration.</li>
@@ -313,6 +313,9 @@ paired with that snapshot.</li>
 <li><code>FirecrackerSandbox::resume_from_snapshot_config(&amp;FirecrackerSnapshotConfig)</code>
 <ul>
 <li>Creates a new sandbox handle and immediately starts it from a snapshot config.</li>
+<li>Uses the node’s currently configured Firecracker, whether taking a prewarmed
+process or starting a new one. Cross-version snapshot compatibility is
+provided by that Firecracker runtime.</li>
 <li>Uses <code>vm_state_path</code>, the memory overlay image config, and
 <code>base_rootfs_path</code> from the config.</li>
 <li>Returns a running sandbox after Firecracker and envd are ready.</li>
@@ -395,7 +398,9 @@ snapshot-backed template launches, this means recreating runtime image configs a
 writable uppers from the committed layer stack.</li>
 <li>Rootfs copies use copy-on-write helpers where available.</li>
 <li>Firecracker runs with <code>current_dir = work_dir</code>, so relative paths work.</li>
-<li>Firecracker logs default to <code>work_dir/logs/*</code> unless explicit log paths are configured.</li>
+<li>Firecracker logging is disabled by default. Set <code>firecracker.log_level</code> to enable
+stdout/stderr capture and <code>firecracker.log</code> under the configured serial directory.
+Direct Rust callers can also opt individual streams in using explicit destinations.</li>
 <li><code>start()</code> waits for both the API socket and envd readiness.</li>
 <li>Although the Firecracker process will be killed on drop, explicit <code>stop()</code> is recommended.</li>
 </ul>
@@ -446,7 +451,7 @@ socket_poll_ms = 20
 # work_dir = "/path/to/firecracker-work"
 # Optional override; defaults to $AENV_HOME/logs/serial.
 # serial_dir = "/path/to/serial"
-# Optional; enables Firecracker's own logging when set to a non-empty level.
+# Optional; enables stdout/stderr capture and firecracker.log when non-empty.
 # log_level = "Info"
 
 [kernel]
@@ -494,13 +499,14 @@ directories. These directories include runtime sockets, symlinks, local
 logs, and writable OverlayBD upper layer data (<code>overlaybd/upper.data</code> and
 <code>overlaybd/upper.index</code>). Defaults to <code>$AENV_HOME/firecracker-work</code>.</li>
 <li><code>serial_dir</code>: Optional override for the persistent output directory.
-Serial output is written under a per-sandbox subdirectory and not removed
-by the sandbox. Defaults to <code>$AENV_HOME/logs/serial</code>.</li>
+When logging is enabled, serial output is written under a per-sandbox subdirectory
+and not removed by the sandbox. Defaults to <code>$AENV_HOME/logs/serial</code>.
+Setting this path alone does not enable logging.</li>
 <li><code>log_level</code>: Optional Firecracker log level (<code>Error</code>, <code>Warning</code>, <code>Info</code>,
 <code>Debug</code>, <code>Trace</code>, case-insensitive). When set to a non-empty value,
-Firecracker’s own logging is enabled and written to a <code>firecracker.log</code>
-file in the sandbox’s log directory (the same directory used for serial
-output). If omitted or empty, Firecracker logging is disabled.</li>
+stdout/stderr capture and <code>firecracker.log</code> are enabled in the sandbox’s
+log directory. If omitted or empty, stdout/stderr are discarded and no log
+directories are created, unless explicit Rust capture destinations are set.</li>
 </ul>
 </li>
 <li>
@@ -860,11 +866,11 @@ delete template-backed sandboxes while keeping proxy lookup state in sync.</li>
 </ul>
 <h2 id="4-end-to-end-execution-checklist"><a class="header" href="#4-end-to-end-execution-checklist">4) End-to-End Execution Checklist</a></h2>
 <ol>
-<li>Provide Firecracker binary, kernel, tools drive, overlaybd runtime, and ublk daemon. These are automatically downloaded when the server starts, or you can run <code>cargo run --bin server -- --setup-only</code> to provision runtime dependencies independently.</li>
+<li>Provide Firecracker binary, kernel, tools drive, overlaybd runtime, and ublk daemon. Host dependencies are downloaded when the server starts, or with <code>cargo run --bin server -- --setup-only</code>. Tools are prepared on launch or restore using the recorded tools version.</li>
 <li>Provision host access once as root with <code>server --setup-host --runtime-user &lt;user&gt; --runtime-group &lt;group&gt;</code>. The group is the runtime service group: it
 owns AgentENV state and receives ublk device access. Normal server startup
 performs validation only and never invokes <code>sudo</code>.</li>
-<li>Host setup installs a udev rule for <code>/dev/ublk-control</code>, <code>/dev/ublkc*</code>, and <code>/dev/ublkb*</code>, so the runtime group can access the control and dynamic device nodes.</li>
+<li>Host setup installs a udev rule for <code>/dev/ublk-control</code>, <code>/dev/ublkc*</code>, and <code>/dev/ublkb*</code>, so the runtime group can access the control and dynamic device nodes. The same rule sets the I/O scheduler of each <code>/dev/ublkb*</code> to <code>none</code>.</li>
 <li>Update <code>config/default.toml</code> paths, or point <code>AENV_CONFIG_PATH</code> to a custom config file.</li>
 <li>Ensure <code>/dev/kvm</code> is accessible by the runtime user and the configured
 virtualization mode matches the host modules.</li>
@@ -916,6 +922,83 @@ cargo test -p agentenv --lib
 </code></pre>
 </li>
 </ol>
+<h2 id="42-nested-kvm-validation"><a class="header" href="#42-nested-kvm-validation">4.2) Nested KVM Validation</a></h2>
+<p><code>scripts/tests/nestedvirt-smoke.py</code> builds a test image and exercises template
+restoration, fork, and pause/resume with QEMU running inside an x86_64 sandbox.
+Run it when changing the nested-KVM runtime, snapshot handling, or guest kernel.</p>
+<ol>
+<li>Use an x86_64 host with nested KVM and an outer guest kernel with built-in
+KVM. Install Python 3.11+, QEMU x86 system binaries, static BusyBox at
+<code>/bin/busybox</code>, cpio, and Bash. Provide a bootable bzImage for the inner guest
+and a fresh work directory with at least 5 GiB free.</li>
+<li>Prepare a dedicated AgentENV node using the host setup above. Use separate
+<code>AENV_HOME_PATH</code>, <code>AENV_RUNTIME_PATH</code>, and network pools; select test assets
+with <code>AENV_DEPS_PATH</code>. Bind the API to loopback and set
+<code>[sandbox_proxy].domains</code>, for example to <code>["nested.local"]</code>.</li>
+<li>Keep the complete <code>[firecracker].boot_args</code> string and append <code>no-kvmapf</code>;
+the runner checks this argument. Set <code>[pool.block].enabled = true</code>.
+Configure regctl for the runner’s loopback registry with
+<code>--host reg=127.0.0.1:18091,tls=disabled</code>; match the port to <code>--port</code>.</li>
+<li>Start the node, then use <code>python3 scripts/tests/nestedvirt-smoke.py run --help</code>
+for SDK installation, parameters, and a complete invocation. Pass the node’s
+TOML file with <code>--config</code>, including its effective boot arguments.</li>
+<li>Require a successful exit and one result per selected phase and round in
+<code>&lt;work&gt;/evidence/api-results.json</code> (nine with defaults). Guest commands and
+output are in <code>api-commands.jsonl</code>. Stop the test node after the run.</li>
+</ol>
+<p>The runner builds one template, then creates a source sandbox and two fork
+children per case. The guest payload <code>nestedvirt-guest.sh</code> starts and stops QEMU with <code>accel=kvm</code> and supplies
+an inner-guest counter.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Phase</th><th>Recovery check</th></tr>
+</thead>
+<tbody>
+<tr><td><code>unused</code></td><td>A fresh inner VM starts after fork and pause/resume.</td></tr>
+<tr><td><code>initialized</code></td><td>QEMU created with <code>-S</code> retains KVM-enabled <code>prelaunch</code> state.</td></tr>
+<tr><td><code>running</code></td><td>The inner counter continues advancing after fork and pause/resume.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Each case also starts and stops a fresh inner VM in the source and both children;
+the initialized case replaces its stopped inner VM. Existing snapshots retain
+their captured kernel and boot arguments, so use fresh templates to test changes
+to either. Hosted CI runs syntax and <code>check-fixture</code> checks; the lifecycle matrix
+runs on nested-KVM hardware.</p>
+<h2 id="43-legacy-v9-snapshot-recovery"><a class="header" href="#43-legacy-v9-snapshot-recovery">4.3) Legacy v9 Snapshot Recovery</a></h2>
+<p><code>orchestrator_v9_snapshot_upgrade</code> in <code>tests/integration/orchestrator.rs</code> runs the
+current AgentENV test binary with old and current Firecracker processes. It
+saves v9 state, invalidates the recorded executable path, restores with the
+configured runtime, checks envd, and saves again as v1000.</p>
+<ol>
+<li>
+<p>Prepare <code>v9-node.toml</code> and <code>current-node.toml</code> with their respective runtimes
+and matching helpers. Use absolute paths and the same state, storage,
+network, guest kernel, and boot arguments in both configurations.</p>
+</li>
+<li>
+<p>Complete the integration host setup above and build the daemon with
+<code>make build-ublk PROFILE=debug</code>.</p>
+</li>
+<li>
+<p>Run the test explicitly; it is ignored by default because it needs both
+runtime versions:</p>
+<pre><code class="language-bash">AENV_HOME_PATH=/absolute/path/isolated-test/home \
+AENV_RUNTIME_PATH=/absolute/path/isolated-test/run \
+AENV_DEPS_PATH=/absolute/path/test-deps \
+AENV_UBLK_DAEMON_BINARY_PATH="$PWD/target/debug/uvm-ublk-daemon" \
+AENV_CONFIG_PATH=/absolute/path/current-node.toml \
+AENV_TEST_V9_CONFIG=/absolute/path/v9-node.toml \
+scripts/run-with-capabilities.sh cargo test -p agentenv \
+  --test orchestrator_integration orchestrator::orchestrator_v9_snapshot_upgrade \
+  -- --exact --ignored --nocapture
+</code></pre>
+</li>
+</ol>
+<p>For service-upgrade validation, create templates and paused records with the old
+AgentENV binary, stop it, start the new binary against the same state, and verify
+restore, fork, and another pause/resume cycle.</p>
 <h2 id="5-running-custom-scripts"><a class="header" href="#5-running-custom-scripts">5) Running Custom Scripts</a></h2>
 <h3 id="run-commands-via-envd"><a class="header" href="#run-commands-via-envd">Run commands via envd</a></h3>
 <p>Once the sandbox is started (with a rootfs that includes the envd daemon), you
@@ -953,6 +1036,35 @@ into it (for example using <code>debugfs</code>).</li>
 </ol>
 <p>The guest must keep a long-running dispatcher (started during the initial
 boot) that watches for these per-instance files and executes them after resume.</p>
+<h2 id="6-fresh-sandbox-throughput-benchmarks"><a class="header" href="#6-fresh-sandbox-throughput-benchmarks">6) Fresh Sandbox Throughput Benchmarks</a></h2>
+<p>The <code>snapshot</code> benchmark has two base-image launch measurements:</p>
+<ul>
+<li><code>concurrent_fresh_start_throughput</code>: time <code>start()</code> until the guest is ready;
+stop the sandboxes after timing.</li>
+<li><code>concurrent_fresh_start_stop_throughput</code>: time <code>start()</code> and <code>stop()</code> together.</li>
+</ul>
+<p>Each batch uses separate sandboxes and reports completed launches per second.
+Image resolution and sandbox construction happen before timing. This measures
+the sandbox backend, not HTTP or scheduler requests. A fresh launch does not
+necessarily mean a cold Firecracker process pool.</p>
+<p>On a Linux host with KVM and ublk, run from the repository root. Set up the
+dependencies once before running the benchmark:</p>
+<pre><code class="language-bash">export AENV_HOME_PATH="$HOME/.local/share/agentenv-fresh-bench/home"
+export AENV_RUNTIME_PATH="$HOME/.local/share/agentenv-fresh-bench/run"
+export AENV_FIRECRACKER_WORK_DIR="/tmp/aenv-fresh-fc-$(id -u)"
+export AENV_DEPS_PATH="$HOME/.local/share/aenv/deps"
+export AENV_UBLK_DAEMON_BINARY_PATH="$AENV_HOME_PATH/ublk/uvm-ublk-daemon"
+make install-ublk PROFILE=release AENV_INSTALL_SUDO=
+cargo run --bin server -- --setup-only
+AENV_BENCH_CONCURRENCY=2 \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
+  cargo bench -p agentenv-benchmarks --bench snapshot -- fresh_start_
+</code></pre>
+<p>The filter runs both measurements. The default runner takes bounded samples;
+set <code>AENV_BENCH_FULL=1</code> for Criterion. <code>AENV_BENCH_CONCURRENCY</code> defaults to twice
+the available CPU parallelism, up to 50. A failed operation fails the batch;
+the benchmark attempts to stop any remaining sandboxes and reports cleanup
+errors.</p>
 
                     </main>
 
